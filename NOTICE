@@ -1,0 +1,12 @@
+claude-agent-acp
+Copyright Zed Industries, Inc. and the Agent Client Protocol authors
+Licensed under the Apache License, Version 2.0.
+
+This product includes code derived from claude-agent-tui
+(https://github.com/zeo-workspace/claude-agent-tui),
+Copyright 2026 lucascouts, licensed under the Apache License, Version 2.0.
+The derived files, each marked in its header and modified from the original:
+
+  src/tui/pty.ts          from src/engine-pty.ts
+  src/tui/transcript.ts   from src/jsonl.ts
+  src/tui/end-of-turn.ts  from src/end-of-turn.ts

@@ -1,0 +1,11 @@
+   ◐ medium · /effort
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ❯  Try "how do I log an error?"
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+     Haiku 5.5   │   medium   │   $0.00
+   [PONYTAIL]   │   <cwd>         ▐ ▛███▛█    Claude Code   v2.1.328
+  ▝▜ █ █ █▀  Haiku 5.5 · Claude API
+   ▝▝   ▝▝   <cwd>
+
+  ⚠ Code Mode (experimental) is on · this session can be resumed only with Code Mode on
+    ⎿  SessionStart:startup says: View Observations Live @ http://localhost:37701

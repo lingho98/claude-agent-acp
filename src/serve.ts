@@ -1,6 +1,7 @@
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { v1AgentApp, type ClaudeAcpAgent } from "./v1/acp-agent.js";
 import type { Logger } from "./logger.js";
+import { tuiAgentApp } from "./tui/agent.js";
 import { nodeToWebReadable, nodeToWebWritable } from "./utils.js";
 import { v2AgentApp, type AgentHandle } from "./v2/agent.js";
 
@@ -24,7 +25,10 @@ export function acpProtocolsFromEnv(value: string | undefined): AcpProtocols {
   );
 }
 
-/** Serves ACP on stdio through {@link acpProtocolRouter}. */
+/**
+ * Serves ACP on stdio through {@link acpProtocolRouter}, or with
+ * `CLAUDE_ACP_ENGINE=tui` through the terminal engine (`src/tui/agent.ts`).
+ */
 export function serveAcp(
   logger: Logger | undefined,
   options: { protocols: AcpProtocols },
@@ -37,9 +41,11 @@ export function serveAcp(
   const onAgent = (created: AgentHandle) => {
     agent = created;
   };
-  const { closed } = acpProtocolRouter(logger, onAgent, options.protocols, {
-    onV2Agent: onAgent,
-  }).connect(v2.ndJsonStream(output, input));
+  const router =
+    process.env.CLAUDE_ACP_ENGINE === "tui"
+      ? tuiProtocolRouter(logger, onAgent, options.protocols)
+      : acpProtocolRouter(logger, onAgent, options.protocols, { onV2Agent: onAgent });
+  const { closed } = router.connect(v2.ndJsonStream(output, input));
   return {
     closed,
     dispose: async () => {
@@ -70,4 +76,19 @@ export function acpProtocolRouter(
     router.withV2(v2AgentApp(logger, onV2Agent));
   }
   return router;
+}
+
+/**
+ * The terminal engine's router. It serves ACP v1 alone, so a v2 client is
+ * negotiated down to v1, and `CLAUDE_AGENT_ACP_PROTOCOL=v2` fails at startup.
+ */
+export function tuiProtocolRouter(
+  logger: Logger | undefined,
+  onAgent: (agent: AgentHandle) => void,
+  protocols: AcpProtocols,
+): v2.AgentProtocolRouter {
+  if (protocols === "v2") {
+    throw new Error("CLAUDE_ACP_ENGINE=tui serves ACP v1 only; unset CLAUDE_AGENT_ACP_PROTOCOL.");
+  }
+  return v2.agentProtocolRouter().withV1(tuiAgentApp(logger, onAgent));
 }
