@@ -10,7 +10,8 @@
  * from the one the user is asked about, which fails the turn. The trust
  * dialog is never answered without the user: declining it, or no `askUser`,
  * fails the prompt and names the folder. A mid-turn answer that arrives after
- * the CLI closed its dialog, "No" included, writes no keys and fails the turn.
+ * the CLI closed its dialog, "No" included, sends none of the answer's keys,
+ * interrupts the CLI and fails the turn.
  */
 
 import { randomUUID } from "node:crypto";
@@ -440,7 +441,7 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
    * {@link interrupt}). Another dialog while the user is asked fails the turn:
    * the asked one is gone, or was never a dialog (model output that quotes one).
    * An answer that arrives once the input box is back with no dialog after it
-   * writes no keys and fails the turn.
+   * sends none of its keys, interrupts the CLI and fails the turn.
    */
   private relayDialog(pty: ClaudePty): void {
     const turn = this.turn;
@@ -490,7 +491,7 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
       const since = pty.screenSince(mark);
       if (showsInputBox(since) && !detectDialog(since)) {
         // The answer's keys would land on the input box, not on the dialog.
-        this.endTurn(
+        this.interrupt(
           new Error(
             `The Claude CLI closed the dialog "${dialog.question}" before your answer arrived, ` +
               "so the adapter sent nothing. Send the prompt again.",

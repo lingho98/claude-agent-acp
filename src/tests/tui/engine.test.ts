@@ -423,7 +423,7 @@ describe("TuiEngine", () => {
     ["allows", "allow_always"],
     ["declines", "reject_once"],
   ])(
-    "writes no keys and fails the turn when the user %s after the dialog closed",
+    "sends none of the answer's keys, interrupts the CLI and fails the turn when the user %s after the dialog closed",
     async (_name, kind) => {
       const user = userAsked();
       engineWith(user.askUser);
@@ -437,10 +437,30 @@ describe("TuiEngine", () => {
       await expect(turn.done).rejects.toThrow(
         'The Claude CLI closed the dialog "Do you want to proceed?" before your answer arrived',
       );
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(pty.written.slice(sent)).toEqual([]);
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      // Only the interrupt's keys: Ctrl+C, then Esc a second later.
+      expect(pty.written.slice(sent)).toEqual(["\x03", ESC]);
     },
   );
+
+  it("sends no Enter onto a dialog the CLI shows after a late answer, before the turn clears", async () => {
+    const user = userAsked();
+    engineWith(user.askUser);
+    const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));
+    pty.output(fixtureText("tool-bash-screen.txt"));
+    const asked = await user.next(1);
+    pty.output(fixtureText("ready-screen.txt"));
+    asked.choose((options) => options.find(({ kind }) => kind === "allow_always"));
+    await expect(turn.done).rejects.toThrow(/before your answer arrived/);
+    // The CLI works on and asks about a Write; the next prompt's Enter would approve it.
+    pty.output(fixtureText("tool-write-screen.txt"));
+    const sent = pty.written.length;
+    const next = engine.prompt("next");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(pty.written.slice(sent)).not.toContain("\r");
+    engine.cancel();
+    await next.done;
+  });
 
   it("declines with Esc and fails the turn when the permission request fails", async () => {
     engineWith(async () => Promise.reject(new Error("connection closed")));
