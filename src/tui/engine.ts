@@ -494,7 +494,7 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
         this.interrupt(
           new Error(
             `The Claude CLI closed the dialog "${dialog.question}" before your answer arrived, ` +
-              "so the adapter sent nothing. Send the prompt again.",
+              "so your answer was not sent and the CLI's turn was stopped. Send the prompt again.",
           ),
         );
         return;

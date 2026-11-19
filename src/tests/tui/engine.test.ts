@@ -436,7 +436,8 @@ describe("TuiEngine", () => {
       pty.output(fixtureText("ready-screen.txt"));
       asked.choose((options) => options.find((option) => option.kind === kind));
       await expect(turn.done).rejects.toThrow(
-        'The Claude CLI closed the dialog "Do you want to proceed?" before your answer arrived',
+        'The Claude CLI closed the dialog "Do you want to proceed?" before your answer arrived, ' +
+          "so your answer was not sent and the CLI's turn was stopped. Send the prompt again.",
       );
       await new Promise((resolve) => setTimeout(resolve, 1200));
       // Only the interrupt's keys: Ctrl+C, then Esc a second later.
