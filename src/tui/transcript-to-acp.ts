@@ -222,13 +222,14 @@ export class TranscriptToAcp {
     if (Array.isArray(block.content)) {
       // A declined permission: `[{type: "text", text: "<repl-output>\n<error>The user doesn't
       // want to proceed…"}, {type: "text", text: "The user stopped this call…"}]`, is_error
-      // set. No `repl-error-…` pair repeats it, so no failed REPL call is counted.
+      // set. No `repl-error-…` pair repeats it, so no failed REPL call is counted. The text
+      // escapes `<`, `>` and `&`, as a settle event's does.
       const parts = (block.content as Array<{ type?: unknown; text?: unknown }>).map((part) => {
         const output =
           part?.type === "text" && typeof part.text === "string"
             ? replOutput(part.text)
             : undefined;
-        return output ? { ...part, text: output.text } : part;
+        return output ? { ...part, text: unescapeXml(output.text) } : part;
       });
       return { ...block, content: parts };
     }

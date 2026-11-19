@@ -186,6 +186,34 @@ describe("TranscriptToAcp", () => {
     expect(JSON.stringify(updates)).not.toMatch(/<\/?(repl-output|error)>/);
   });
 
+  it("unescapes a declined REPL call's text", () => {
+    const [call, declined, ...rest] = fixture("repl-declined");
+    const [first, ...others] = declined.message?.content as Array<{ content: unknown[] }>;
+    const escaped = {
+      ...declined,
+      message: {
+        role: "user",
+        content: [
+          {
+            ...first,
+            content: [
+              {
+                type: "text",
+                text: "<repl-output>\n<error>The user declined Bash(printf a &gt; f &amp;&amp; echo &lt;x&gt;)</error>\n</repl-output>",
+              },
+              ...first.content.slice(1),
+            ],
+          },
+          ...others,
+        ],
+      },
+    };
+    const { updates } = updatesOf([call, escaped, ...rest]);
+    const text = JSON.stringify(callUpdates(updates, "toolu_015MLah8fZ3GvLMfuR9CWyg3").at(-1));
+    expect(text).toContain("printf a > f && echo <x>");
+    expect(text).not.toMatch(/&(gt|lt|amp);/);
+  });
+
   it("fails a REPL call that ended within its turn with an error, and drops its repeat", () => {
     const [call, result] = fixture("repl-output");
     const replError = fixture("repl-error").slice(-2);
