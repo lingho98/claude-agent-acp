@@ -13,8 +13,8 @@
  *    the code finished; the call completes with that result. A script that
  *    threw settles with an `<error>` in place of the `<result>`, and fails the
  *    call. The event escapes `<`, `>` and `&` in the text. A script that
- *    threw within ~50 ms settles before steps 1 and 2 are written; the
- *    event then waits for its dispatch.
+ *    throws at once (19 and 23 ms in two captures) can settle before steps
+ *    1 and 2 are written; the event then waits for its dispatch.
  * 4. The tools the code called, as `isVirtual` assistant/user pairs with
  *    `repl_…` ids. No field links them to their REPL call, so each is a tool
  *    call of its own. After a script threw, a `repl-error-…` pair repeats its
