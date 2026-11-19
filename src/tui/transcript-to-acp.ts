@@ -10,10 +10,17 @@
  * 2. user `tool_result` "(dispatched #N)" whose `toolUseResult` is
  *    `{asyncDispatched: true, evalId: N}`: the code runs on; the call stays in progress.
  * 3. `queue-operation` enqueue `<event kind="repl-eval" eval="N" status="settled"><result>…`:
- *    the code finished; the call completes with that result.
+ *    the code finished; the call completes with that result. A script that
+ *    threw settles with an `<error>` in place of the `<result>`, and fails the
+ *    call. The event escapes `<`, `>` and `&` in the text.
  * 4. The tools the code called, as `isVirtual` assistant/user pairs with
  *    `repl_…` ids. No field links them to their REPL call, so each is a tool
- *    call of its own.
+ *    call of its own. After a script threw, a `repl-error-…` pair repeats its
+ *    error; it is dropped once the REPL call failed with that error.
+ *
+ * A REPL call that ends within its turn has no dispatch: its `tool_result`
+ * holds `<repl-output><tools-used-before-summary>…</…><result>…</result></repl-output>`,
+ * and the call shows the result's text.
  *
  * Every other record (`mode`, `attachment`, `api-request`, the other
  * `system` rows, …) is dropped.
@@ -37,13 +44,25 @@ export type TranscriptToAcpOptions = {
   logger: Logger;
 };
 
-type ContentBlock = { type?: unknown; tool_use_id?: unknown };
+type ContentBlock = {
+  type?: unknown;
+  id?: unknown;
+  tool_use_id?: unknown;
+  content?: unknown;
+  is_error?: unknown;
+};
+
+const REPL_ERROR_ID = "repl-error-";
 
 export class TranscriptToAcp {
   private readonly toolUseCache: ToolUseCache = {};
   private readonly emittedToolCalls = new Set<string>();
   /** The REPL call of each eval that runs on, from "(dispatched #N)" to its settle event. */
   private readonly dispatched = new Map<number, string>();
+  /** REPL calls failed with a thrown error whose `repl-error-…` pair is still to drop. */
+  private failedRepls = 0;
+  /** The `repl-error-…` tool calls dropped, whose results are dropped too. */
+  private readonly droppedReplErrors = new Set<string>();
 
   constructor(private readonly options: TranscriptToAcpOptions) {}
 
@@ -57,7 +76,7 @@ export class TranscriptToAcp {
     }
     switch (record.type) {
       case "assistant":
-        return this.content(record.message?.content, "assistant", {
+        return this.content(this.withoutReplError(record.message?.content), "assistant", {
           messageId: messageIdForGrouping(record),
           replay,
         });
@@ -83,17 +102,48 @@ export class TranscriptToAcp {
     }));
     this.emittedToolCalls.clear();
     this.dispatched.clear();
+    this.failedRepls = 0;
+    this.droppedReplErrors.clear();
     for (const id of Object.keys(this.toolUseCache)) {
       delete this.toolUseCache[id];
     }
     return updates;
   }
 
+  /**
+   * `content` without a `repl-error-…` call that repeats the error a REPL
+   * call already failed with. With no such REPL call, the `repl-error-…` call
+   * may be the only report of the error, and stays.
+   */
+  private withoutReplError(content: unknown): unknown {
+    if (!Array.isArray(content)) {
+      return content;
+    }
+    return (content as ContentBlock[]).filter((block) => {
+      const drop =
+        this.failedRepls > 0 &&
+        block?.type === "tool_use" &&
+        typeof block.id === "string" &&
+        block.id.startsWith(REPL_ERROR_ID);
+      if (drop) {
+        this.failedRepls--;
+        this.droppedReplErrors.add(block.id as string);
+      }
+      return !drop;
+    });
+  }
+
   private user(record: TranscriptRecord, replay: boolean): SessionNotification[] {
     const content = record.message?.content;
-    const results = Array.isArray(content)
+    const blocks = Array.isArray(content)
       ? (content as ContentBlock[]).filter((block) => block?.type === "tool_result")
       : [];
+    const results = blocks
+      .filter((block) => !this.droppedReplErrors.delete(block.tool_use_id as string))
+      .map((block) => this.withReplOutput(block));
+    if (blocks.length > 0 && results.length === 0) {
+      return []; // The result of a dropped `repl-error-…` call.
+    }
     if (results.length === 0) {
       // The user's prompt: the client sent it, so only a replay shows it.
       const text = replay && record.isMeta !== true ? stripLocalCommandMetadata(content) : null;
@@ -130,13 +180,37 @@ export class TranscriptToAcp {
       return [];
     }
     this.dispatched.delete(event.evalId);
+    const isError = event.status !== "settled" || event.tag === "error";
+    if (event.tag === "error") {
+      this.failedRepls++;
+    }
     const result = {
       type: "tool_result" as const,
       tool_use_id: toolUseId,
       content: event.output,
-      is_error: event.status !== "settled",
+      is_error: isError,
     };
     return this.content([result], "user", { replay });
+  }
+
+  /** A REPL `tool_result` whose text is a `<repl-output>`, with the plain text of its result. */
+  private withReplOutput(block: ContentBlock): ContentBlock {
+    const call = this.toolUseCache[block.tool_use_id as string];
+    const output =
+      call?.name === "REPL" && typeof block.content === "string"
+        ? replOutput(block.content)
+        : undefined;
+    if (!output) {
+      return block;
+    }
+    if (output.tag === "error") {
+      this.failedRepls++;
+    }
+    return {
+      ...block,
+      content: output.text,
+      is_error: block.is_error === true || output.tag === "error",
+    };
   }
 
   private content(
@@ -166,12 +240,13 @@ export class TranscriptToAcp {
 }
 
 /**
- * The eval number, status and output of a `repl-eval` event, e.g.
+ * The eval number, status, output and its tag (`result` or `error`) of a
+ * `repl-eval` event, e.g.
  * `<event nonce="…" kind="repl-eval" eval="1" ms="1209" status="settled">\n<result>one.txt</result>\n</event>`.
  */
 function replEvalEvent(
   text: string,
-): { evalId: number; status: string | undefined; output: string } | undefined {
+): { evalId: number; status: string | undefined; output: string; tag?: string } | undefined {
   const head = /^<event\b([^>]*)>/.exec(text);
   if (!head || attribute(head[1], "kind") !== "repl-eval") {
     return undefined;
@@ -181,7 +256,38 @@ function replEvalEvent(
     return undefined;
   }
   const body = /<(\w+)>([\s\S]*)<\/\1>/.exec(text.slice(head[0].length));
-  return { evalId, status: attribute(head[1], "status"), output: body?.[2] ?? "" };
+  return {
+    evalId,
+    status: attribute(head[1], "status"),
+    output: unescapeXml(body?.[2] ?? ""),
+    tag: body?.[1],
+  };
+}
+
+/**
+ * The text of a `<repl-output>`'s `<result>` or `<error>`, without the
+ * `<tools-used-before-summary>` line. Any other part stays as it is.
+ */
+function replOutput(text: string): { text: string; tag?: string } | undefined {
+  const body = /^<repl-output>([\s\S]*)<\/repl-output>$/.exec(text.trim())?.[1];
+  if (body === undefined) {
+    return undefined;
+  }
+  const rest = body
+    .replace(/<tools-used-before-summary>[\s\S]*?<\/tools-used-before-summary>/, "")
+    .trim();
+  const result = /^<(result|error)>([\s\S]*)<\/\1>$/.exec(rest);
+  return result ? { text: result[2], tag: result[1] } : { text: rest };
+}
+
+/** `text` with XML's character escapes undone; `&amp;` last, so "&amp;lt;" stays "&lt;". */
+function unescapeXml(text: string): string {
+  return text
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll("&amp;", "&");
 }
 
 function attribute(attributes: string, name: string): string | undefined {

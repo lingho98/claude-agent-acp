@@ -119,6 +119,56 @@ describe("TranscriptToAcp", () => {
     expect(adapter.endTurn()).toEqual([]);
   });
 
+  it("shows a REPL call that ended within its turn with its result's text, not the wrapper tags", () => {
+    const { updates } = updatesOf(fixture("repl-output"));
+    const [result] = callUpdates(updates, "toolu_015d69hs84ghGQTRzH7RrkQQ").slice(-1);
+    expect(result).toMatchObject({ status: "completed" });
+    const text = JSON.stringify(result);
+    expect(text).toContain("bytes: 2");
+    expect(text).not.toMatch(/<\/?(repl-output|tools-used-before-summary|result)>/);
+  });
+
+  it("fails a REPL call whose script threw, with the error unescaped, and drops its repeat", () => {
+    const records = fixture("repl-error");
+    const replError = "repl-error-8be964b9-26af-4bb2-bddd-babb6318f283";
+    const { updates } = updatesOf(records);
+    expect(callUpdates(updates, "toolu_0165tUGYo3KZ4Vqazo9bZ6YA").at(-1)).toMatchObject({
+      status: "failed",
+      content: [
+        expect.anything(),
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: expect.stringMatching(
+              /ReferenceError: Buffer is not defined\n[\s\S]*in <anonymous>:/,
+            ),
+          },
+        },
+      ],
+    });
+    expect(callUpdates(updates, replError)).toEqual([]);
+    // With no REPL call failed, the repeat is the only report of the error, and stays.
+    expect(callUpdates(updatesOf(records.slice(-2)).updates, replError)).toContainEqual(
+      expect.objectContaining({ status: "failed" }),
+    );
+  });
+
+  it("undoes &amp; last in a settled eval's text", () => {
+    const records = fixture("repl-error").map((record) =>
+      record.type === "queue-operation" && typeof record.content === "string"
+        ? {
+            ...record,
+            content: record.content.replace("&lt;anonymous&gt;", "&amp;lt;x&amp;gt; &quot;&#39;"),
+          }
+        : record,
+    );
+    const text = JSON.stringify(
+      callUpdates(updatesOf(records).updates, "toolu_0165tUGYo3KZ4Vqazo9bZ6YA"),
+    );
+    expect(text).toContain(`in &lt;x&gt; \\"'`);
+  });
+
   it("fails a REPL call whose eval did not settle", () => {
     const records = fixture("code-mode-sonnet").map((record) =>
       record.type === "queue-operation" && typeof record.content === "string"
