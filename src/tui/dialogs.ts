@@ -134,10 +134,13 @@ export function detectDialog(screen: string): Dialog | undefined {
   };
 }
 
-/** Whether `a` and `b` are one dialog drawn twice: the same question, options and cursor. */
+/**
+ * Whether `a` and `b` are one dialog drawn twice: the same lines above the
+ * options (the command or file a tool permission names), options and cursor.
+ */
 export function sameDialog(a: Dialog, b: Dialog): boolean {
   return (
-    a.question === b.question &&
+    a.excerpt === b.excerpt &&
     a.cursor === b.cursor &&
     a.options.length === b.options.length &&
     a.options.every(({ label }, i) => label === b.options[i].label)

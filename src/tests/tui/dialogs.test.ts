@@ -154,10 +154,15 @@ describe("detectDialog", () => {
 });
 
 describe("sameDialog", () => {
-  it("matches a redraw and tells another dialog or a moved cursor apart", () => {
+  it("matches a redraw and tells another dialog, command or cursor apart", () => {
     const bash = dialogOf(BASH_SCREEN);
     expect(sameDialog(bash, dialogOf(BASH_SCREEN))).toBe(true);
     expect(sameDialog(bash, dialogOf(WRITE_SCREEN))).toBe(false);
+    const otherCommand = BASH_SCREEN.replace(
+      "   mkdir -p made && touch made/x.txt \r",
+      "   rm -rf made \r",
+    );
+    expect(sameDialog(bash, dialogOf(otherCommand))).toBe(false);
     const moved = BASH_SCREEN.replace("❯  1.", "   1.").replace("    4.  No", " ❯  4.  No");
     expect(sameDialog(bash, dialogOf(moved))).toBe(false);
   });

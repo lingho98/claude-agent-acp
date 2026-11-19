@@ -402,6 +402,23 @@ describe("TuiEngine", () => {
     },
   );
 
+  it("declines a real dialog with the quoted one's question and options, but another command", async () => {
+    const user = userAsked();
+    engineWith(user.askUser);
+    const { turn, pty } = await promptPastStartup("summarize", fixtureText("ready-screen.txt"));
+    const sent = pty.written.length;
+    pty.output(QUOTED_DIALOG);
+    const quoted = await user.next(1);
+    pty.output(
+      `${"─".repeat(60)}\r\n Bash command\r\n   rm -rf build\r\n Do you want to proceed?\r\n` +
+        " ❯ 1. Yes\r\n   2. No\r\n\r\n Esc to cancel · Tab to amend\r\n",
+    );
+    await expect(turn.done).rejects.toThrow(/showed another dialog/);
+    quoted.choose((options) => options.find(({ kind }) => kind === "allow_once"));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(pty.written.slice(sent)).toEqual([ESC]);
+  });
+
   it("declines with Esc and fails the turn when the permission request fails", async () => {
     engineWith(async () => Promise.reject(new Error("connection closed")));
     const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));
