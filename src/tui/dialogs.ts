@@ -24,7 +24,7 @@
  */
 
 import type { PermissionOptionKind } from "@agentclientprotocol/sdk/unstable";
-import { stripAnsi } from "./pty.js";
+import { PTY_COLS, stripAnsi } from "./pty.js";
 
 export type DialogKind = "trust" | "code-mode" | "permission";
 
@@ -77,8 +77,11 @@ const PLAIN_OPTION = /^(❯ ?)?(Yes|No)\b/;
  * redraw, e.g. "⏺", "4" or "· 2s". No letters, no rule, no input box `❯`.
  */
 const SPINNER_REDRAW = /^[^\p{L}─❯]*(\d+s[^\p{L}─❯]*)?$/u;
-/** A rule across the screen: the top of a tool permission dialog. */
-const RULE = /^─{10,}$/;
+/**
+ * A rule across the whole screen: the top of a tool permission dialog. A
+ * shorter one can be a line of the command the dialog names.
+ */
+const RULE = new RegExp(`^─{${PTY_COLS}}$`);
 /** Lines {@link Dialog.excerpt} takes at most from a dialog with no rule above it (trust, Code Mode). */
 const EXCERPT_LINES = 12;
 /** The first excerpt line of a capped dialog; its count grows with the log above the dialog. */

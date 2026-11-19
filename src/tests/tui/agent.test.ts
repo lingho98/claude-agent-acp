@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TuiAcpAgent, type TuiEngineLike } from "../../tui/agent.js";
 import { detectDialog, type Dialog } from "../../tui/dialogs.js";
 import type { TuiEngineOptions, TurnResult } from "../../tui/engine.js";
+import { PTY_COLS } from "../../tui/pty.js";
 import type { TranscriptRecord } from "../../tui/transcript.js";
 import { fixture, fixtureText } from "./fixture.js";
 
@@ -200,7 +201,7 @@ describe("TuiAcpAgent", () => {
     await vi.waitFor(() => expect(engines).toHaveLength(1));
     const script = Array.from({ length: 16 }, (_, i) => `   echo line${i + 1} \r\n`).join("");
     const dialog = detectDialog(
-      `${"─".repeat(60)}\r\n Bash command\r\n${script}\r\n Do you want to proceed?\r\n` +
+      `${"─".repeat(PTY_COLS)}\r\n Bash command\r\n${script}\r\n Do you want to proceed?\r\n` +
         " ❯ 1. Yes\r\n   2. No\r\n\r\n Esc to cancel · Tab to amend\r\n",
     ) as Dialog;
     await engines[0].options.askUser?.(dialog, new AbortController().signal);
