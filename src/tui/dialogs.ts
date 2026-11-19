@@ -79,7 +79,7 @@ const PLAIN_OPTION = /^(❯ ?)?(Yes|No)\b/;
 const SPINNER_REDRAW = /^[^\p{L}─❯]*(\d+s[^\p{L}─❯]*)?$/u;
 /** A rule across the screen: the top of a tool permission dialog. */
 const RULE = /^─{10,}$/;
-/** Lines {@link Dialog.excerpt} takes at most. */
+/** Lines {@link Dialog.excerpt} takes at most from a dialog with no rule above it (trust, Code Mode). */
 const EXCERPT_LINES = 12;
 /** Lines of one option list at most; more means the footer belongs to something else. */
 const MAX_OPTION_LINES = 12;
@@ -239,18 +239,20 @@ function dialogKind(options: ChoiceOption[]): DialogKind {
 }
 
 /**
- * The lines that are not blank above line `start`, up to a rule or
- * {@link EXCERPT_LINES}. Dashed box edges are dropped, and so are tips: they
- * point at the mode-switch options the dialog leaves out.
+ * The lines that are not blank above line `start`: all of them up to the
+ * nearest rule (a tool permission's top), so the user sees a long command
+ * whole; else the last {@link EXCERPT_LINES}, after a line that counts the
+ * rest, e.g. "… (3 more lines not shown)". Dashed box edges are dropped, and
+ * so are tips: they point at the mode-switch options the dialog leaves out.
  */
 function excerptAbove(lines: string[], start: number): string[] {
-  const excerpt: string[] = [];
-  for (let i = start - 1; i >= 0 && excerpt.length < EXCERPT_LINES && !RULE.test(lines[i]); i--) {
-    if (lines[i] && !/^(╌+$|Tip:)/.test(lines[i])) {
-      excerpt.unshift(lines[i]);
-    }
+  const rule = lines.slice(0, start).findLastIndex((line) => RULE.test(line));
+  const excerpt = lines.slice(rule + 1, start).filter((line) => line && !/^(╌+$|Tip:)/.test(line));
+  const hidden = excerpt.length - EXCERPT_LINES;
+  if (rule >= 0 || hidden <= 0) {
+    return excerpt;
   }
-  return excerpt;
+  return [`… (${hidden} more lines not shown)`, ...excerpt.slice(hidden)];
 }
 
 /** The last excerpt line that asks something, up to its "?"; else the last line. */

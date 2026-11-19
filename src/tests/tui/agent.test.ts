@@ -194,6 +194,21 @@ describe("TuiAcpAgent", () => {
     await turn;
   });
 
+  it("titles a long command's permission by its tool line, not the script's first line", async () => {
+    const { sessionId } = await agent.newSession({ cwd: "/work", mcpServers: [] });
+    const turn = prompt(sessionId);
+    await vi.waitFor(() => expect(engines).toHaveLength(1));
+    const script = Array.from({ length: 16 }, (_, i) => `   echo line${i + 1} \r\n`).join("");
+    const dialog = detectDialog(
+      `${"─".repeat(60)}\r\n Bash command\r\n${script}\r\n Do you want to proceed?\r\n` +
+        " ❯ 1. Yes\r\n   2. No\r\n\r\n Esc to cancel · Tab to amend\r\n",
+    ) as Dialog;
+    await engines[0].options.askUser?.(dialog, new AbortController().signal);
+    expect(permissions[0].params.toolCall.title).toBe("Bash command: Do you want to proceed?");
+    engines[0].end({ stopReason: "end_turn" });
+    await turn;
+  });
+
   it("starts no CLI for a prompt that waited on a cancelled turn when the session closes", async () => {
     const { sessionId } = await agent.newSession({ cwd: "/work", mcpServers: [] });
     const first = prompt(sessionId, "first");

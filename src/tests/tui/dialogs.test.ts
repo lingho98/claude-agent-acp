@@ -22,6 +22,16 @@ const BASH_SCREEN = fixtureText("tool-bash-screen.txt");
 const CODE_MODE_SCREEN =
   "Code Mode is experimental.\n  ❯ No, start without it \n Yes, turn on Code Mode\n\n  Enter to confirm";
 
+/** A Bash permission for a script of `lines` lines, each `echo line<n>`. */
+function longBashScreen(lines: number, first = "echo line1"): string {
+  const script = Array.from({ length: lines }, (_, i) => (i === 0 ? first : `echo line${i + 1}`));
+  return (
+    `${"─".repeat(60)}\r\n Bash command\r\n${script.map((line) => `   ${line} \r\n`).join("")}` +
+    "   Runs a long script\r\n\r\n Do you want to proceed?\r\n ❯ 1. Yes\r\n   2. No\r\n\r\n" +
+    " Esc to cancel · Tab to amend\r\n"
+  );
+}
+
 function dialogOf(screen: string): Dialog {
   const dialog = detectDialog(screen);
   if (!dialog) {
@@ -118,6 +128,22 @@ describe("detectDialog", () => {
     expect(keysFor(dialog, dialog.options[2])).toBe(DOWN.repeat(3) + "\r");
   });
 
+  it("keeps every line of a long command up to the dialog's rule", () => {
+    const lines = dialogOf(longBashScreen(16)).excerpt.split("\n");
+    expect(lines).toHaveLength(19);
+    expect(lines.slice(0, 2)).toEqual(["Bash command", "echo line1"]);
+    expect(lines.at(-1)).toBe("Do you want to proceed?");
+  });
+
+  it("caps the lines above a dialog with no rule and counts the ones it leaves out", () => {
+    const screen = Array.from({ length: 15 }, (_, i) => `note ${i + 1}`).join("\n");
+    const dialog = dialogOf(`${screen}\n${CODE_MODE_SCREEN}`);
+    const lines = dialog.excerpt.split("\n");
+    expect(lines).toHaveLength(13);
+    expect(lines.slice(0, 2)).toEqual(["… (4 more lines not shown)", "note 5"]);
+    expect(lines.at(-1)).toBe("Code Mode is experimental.");
+  });
+
   it("counts the keys from a cursor on another row", () => {
     // A redraw with the cursor on "No".
     const screen = BASH_SCREEN.replace("❯  1.", "   1.").replace("    4.  No", " ❯  4.  No");
@@ -165,6 +191,10 @@ describe("sameDialog", () => {
     expect(sameDialog(bash, dialogOf(otherCommand))).toBe(false);
     const moved = BASH_SCREEN.replace("❯  1.", "   1.").replace("    4.  No", " ❯  4.  No");
     expect(sameDialog(bash, dialogOf(moved))).toBe(false);
+    // Two long scripts that differ in their first line only.
+    expect(sameDialog(dialogOf(longBashScreen(16)), dialogOf(longBashScreen(16, "rm -rf ~")))).toBe(
+      false,
+    );
   });
 });
 
