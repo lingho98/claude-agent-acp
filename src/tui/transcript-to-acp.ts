@@ -214,7 +214,10 @@ export class TranscriptToAcp {
     return this.content([result], "user", { replay });
   }
 
-  /** A REPL `tool_result` whose text is a `<repl-output>`, with the plain text of its result. */
+  /**
+   * A REPL `tool_result` whose text is a `<repl-output>`, with the plain text of its result.
+   * The CLI escapes `<`, `>` and `&` in that text, as in a settle event.
+   */
   private withReplOutput(block: ContentBlock): ContentBlock {
     if (this.toolUseCache[block.tool_use_id as string]?.name !== "REPL") {
       return block;
@@ -222,8 +225,7 @@ export class TranscriptToAcp {
     if (Array.isArray(block.content)) {
       // A declined permission: `[{type: "text", text: "<repl-output>\n<error>The user doesn't
       // want to proceed…"}, {type: "text", text: "The user stopped this call…"}]`, is_error
-      // set. No `repl-error-…` pair repeats it, so no failed REPL call is counted. The text
-      // escapes `<`, `>` and `&`, as a settle event's does.
+      // set. No `repl-error-…` pair repeats it, so no failed REPL call is counted.
       const parts = (block.content as Array<{ type?: unknown; text?: unknown }>).map((part) => {
         const output =
           part?.type === "text" && typeof part.text === "string"
@@ -242,7 +244,7 @@ export class TranscriptToAcp {
     }
     return {
       ...block,
-      content: output.text,
+      content: unescapeXml(output.text),
       is_error: block.is_error === true || output.tag === "error",
     };
   }

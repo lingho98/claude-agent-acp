@@ -198,6 +198,27 @@ describe("TranscriptToAcp", () => {
     expect(JSON.stringify(updates)).not.toMatch(/<\/?(repl-output|error)>/);
   });
 
+  it("unescapes the text of a REPL call that ended within its turn", () => {
+    const [call, result] = fixture("repl-output");
+    const [block] = result.message?.content as object[];
+    const escaped = {
+      ...result,
+      message: {
+        role: "user",
+        content: [
+          {
+            ...block,
+            content: "<repl-output>\n<result>a &amp;&amp; b &lt;div&gt;</result>\n</repl-output>",
+          },
+        ],
+      },
+    };
+    const { updates } = updatesOf([call, escaped]);
+    const text = JSON.stringify(callUpdates(updates, "toolu_015d69hs84ghGQTRzH7RrkQQ").at(-1));
+    expect(text).toContain("a && b <div>");
+    expect(text).not.toMatch(/&(gt|lt|amp);/);
+  });
+
   it("unescapes a declined REPL call's text", () => {
     const [call, declined, ...rest] = fixture("repl-declined");
     const [first, ...others] = declined.message?.content as Array<{ content: unknown[] }>;
