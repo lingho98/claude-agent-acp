@@ -438,6 +438,8 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
    * cancels the turn, and a failed request fails it, both declining (see
    * {@link interrupt}). Another dialog while the user is asked fails the turn:
    * the asked one is gone, or was never a dialog (model output that quotes one).
+   * An answer that arrives once the input box is back with no dialog after it
+   * writes no keys and fails the turn.
    */
   private relayDialog(pty: ClaudePty): void {
     const turn = this.turn;
@@ -456,7 +458,7 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
       }
       return;
     }
-    this.dialogMark = pty.mark();
+    const mark = (this.dialogMark = pty.mark());
     const askUser = this.options.askUser;
     if (dialog.cursor === undefined || !askUser) {
       this.emit("unknown-dialog", pty.screen());
@@ -484,6 +486,17 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
         return;
       }
       this.asking = undefined;
+      const since = pty.screenSince(mark);
+      if (showsInputBox(since) && !detectDialog(since)) {
+        // The keys would land on the input box: an arrow recalls a prompt there, Enter sends it.
+        this.endTurn(
+          new Error(
+            `The Claude CLI closed the dialog "${dialog.question}" before your answer arrived, ` +
+              "so the adapter sent nothing. Send the prompt again.",
+          ),
+        );
+        return;
+      }
       this.dialogMark = pty.mark();
       // The cursor was read above. A "No" ends the turn: the CLI writes its interruption row.
       pty.write(option.kind === "reject_once" ? DECLINE : (keysFor(dialog, option) ?? ""));

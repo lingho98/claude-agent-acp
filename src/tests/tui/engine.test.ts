@@ -419,6 +419,29 @@ describe("TuiEngine", () => {
     expect(pty.written.slice(sent)).toEqual([ESC]);
   });
 
+  it.each([
+    ["allows", "allow_always"],
+    ["declines", "reject_once"],
+  ])(
+    "writes no keys and fails the turn when the user %s after the dialog closed",
+    async (_name, kind) => {
+      const user = userAsked();
+      engineWith(user.askUser);
+      const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));
+      const sent = pty.written.length;
+      pty.output(fixtureText("tool-bash-screen.txt"));
+      const asked = await user.next(1);
+      // The dialog is gone: the input box is drawn again, with no dialog after it.
+      pty.output(fixtureText("ready-screen.txt"));
+      asked.choose((options) => options.find((option) => option.kind === kind));
+      await expect(turn.done).rejects.toThrow(
+        'The Claude CLI closed the dialog "Do you want to proceed?" before your answer arrived',
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(pty.written.slice(sent)).toEqual([]);
+    },
+  );
+
   it("declines with Esc and fails the turn when the permission request fails", async () => {
     engineWith(async () => Promise.reject(new Error("connection closed")));
     const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));
