@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChoiceOption, Dialog } from "../../tui/dialogs.js";
 import { TuiEngine, type TuiEngineOptions } from "../../tui/engine.js";
+import { PTY_COLS } from "../../tui/pty.js";
 import type { TranscriptRecord } from "../../tui/transcript.js";
 import { fixture, fixtureText } from "./fixture.js";
 
@@ -410,7 +411,7 @@ describe("TuiEngine", () => {
     pty.output(QUOTED_DIALOG);
     const quoted = await user.next(1);
     pty.output(
-      `${"─".repeat(60)}\r\n Bash command\r\n   rm -rf build\r\n Do you want to proceed?\r\n` +
+      `${"─".repeat(PTY_COLS)}\r\n Bash command\r\n   rm -rf build\r\n Do you want to proceed?\r\n` +
         " ❯ 1. Yes\r\n   2. No\r\n\r\n Esc to cancel · Tab to amend\r\n",
     );
     await expect(turn.done).rejects.toThrow(/showed another dialog/);
