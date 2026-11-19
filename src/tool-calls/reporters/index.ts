@@ -13,6 +13,7 @@ import {
   SkillReporter,
 } from "./interaction.js";
 import { ReadReporter } from "./read.js";
+import { ReplReporter } from "./repl.js";
 import { GlobReporter, GrepReporter } from "./search.js";
 import { WebFetchReporter, WebSearchReporter } from "./web.js";
 
@@ -23,6 +24,7 @@ const reporters: Record<string, ToolReporter> = {
   Bash: bash,
   PowerShell: bash,
   Read: new ReadReporter(),
+  REPL: new ReplReporter(),
   Write: new WriteReporter(),
   Edit: new EditReporter(),
   NotebookEdit: new NotebookEditReporter(),

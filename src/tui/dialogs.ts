@@ -31,6 +31,8 @@ const YES_LABELS: Record<DialogKind, string> = {
 
 const CURSOR = "❯";
 const DOWN = "\x1b[B";
+/** A line break in the screen log: Ink often ends a line with `\r` and moves the cursor down. */
+export const LINE_BREAK = /\r\n|\r|\n/;
 /** Options a select list can have above "Yes"; more means the `❯` belongs to something else. */
 const MAX_OPTIONS_ABOVE = 3;
 
@@ -53,6 +55,19 @@ export function detectDialog(screen: string): Dialog | undefined {
   return { kind: found.kind, keys: keysToYes(screen.slice(0, found.at)) };
 }
 
+/**
+ * Whether `screen` shows the prompt input box, a `❯` line between two rules:
+ *
+ *   ────────────────
+ *   ❯  Try "how do I log an error?"
+ *   ────────────────
+ *
+ * CLI 2.1.328 often ends these lines with `\r` and a cursor move, not `\n`.
+ */
+export function showsInputBox(screen: string): boolean {
+  return /─{20,}[ \t]*[\r\n]+[ \t]*❯[^\r\n]*[\r\n]+[ \t]*─{20,}/.test(screen);
+}
+
 /** Arrow keys from the last `❯` in `before` (the text up to "Yes") down to "Yes", then Enter. */
 function keysToYes(before: string): string | undefined {
   const cursor = before.lastIndexOf(CURSOR);
@@ -62,7 +77,7 @@ function keysToYes(before: string): string | undefined {
   // Each option is one line; the lines from the cursor up to "Yes" are the options above it.
   const above = before
     .slice(cursor + CURSOR.length)
-    .split("\n")
+    .split(LINE_BREAK)
     .slice(0, -1).length;
   if (above > MAX_OPTIONS_ABOVE) {
     return undefined;

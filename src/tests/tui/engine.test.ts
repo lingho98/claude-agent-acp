@@ -7,6 +7,9 @@ import type { TranscriptRecord } from "../../tui/transcript.js";
 import { fixture, fixtureText } from "./fixture.js";
 
 const SESSION_ID = "00000000-0000-4000-8000-000000000001";
+// Built from the text quoted in the task; no capture of this dialog exists yet (see dialogs.test.ts).
+const CODE_MODE_SCREEN =
+  "Code Mode is experimental.\n  ❯ No, start without it \n Yes, turn on Code Mode\n\n  Enter to confirm";
 
 const fake = vi.hoisted(() => {
   // node-pty's IPty, as far as ClaudePty uses it.
@@ -89,17 +92,17 @@ describe("TuiEngine", () => {
     return { turn, pty };
   }
 
-  it("answers the trust dialog, sends the prompt and streams the turn to its end", async () => {
+  it("answers the Code Mode dialog, sends the prompt and streams the turn to its end", async () => {
     const dialogs: string[] = [];
     engine.on("dialog", (kind) => dialogs.push(kind));
     const { turn, pty } = await promptPastStartup(
       "count lines",
-      fixtureText("trust-screen.txt"),
+      CODE_MODE_SCREEN,
       fixtureText("ready-screen.txt"),
     );
     expect(pty.args).toEqual(["--session-id", SESSION_ID]);
     expect(pty.written[0]).toBe("\x1b[B\r");
-    expect(dialogs).toEqual(["trust"]);
+    expect(dialogs).toEqual(["code-mode"]);
     expect(() => engine.prompt("again")).toThrow("Try again when the turn ends");
 
     const transcript = fixture("plain-turn");
@@ -135,8 +138,77 @@ describe("TuiEngine", () => {
     const turn = engine.prompt("hi");
     await vi.waitFor(() => expect(fake.ptys).toHaveLength(1));
     const pty = fake.ptys[0];
-    pty.output(fixtureText("trust-screen.txt"));
-    await expect(turn.done).rejects.toThrow('nothing after the "trust" dialog');
+    pty.output(CODE_MODE_SCREEN);
+    await expect(turn.done).rejects.toThrow('nothing after the "code-mode" dialog');
     expect(pty.written.join("")).not.toContain("\x1b[200~");
+  });
+
+  it("refuses the trust dialog and names the folder", async () => {
+    const turn = engine.prompt("hi");
+    await vi.waitFor(() => expect(fake.ptys).toHaveLength(1));
+    const pty = fake.ptys[0];
+    pty.output(fixtureText("trust-screen.txt"));
+    await expect(turn.done).rejects.toThrow(
+      `Claude Code does not trust the folder ${root}. Run \`claude\` once in ${root}`,
+    );
+    expect(pty.written).toEqual([]);
+  });
+
+  it("waits for the input box before it sends the prompt", async () => {
+    const turn = engine.prompt("hi");
+    await vi.waitFor(() => expect(fake.ptys).toHaveLength(1));
+    const pty = fake.ptys[0];
+    pty.output("Claude Code v2.1.328\n  Loading…\n");
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(pty.written).toEqual([]);
+    pty.output(fixtureText("ready-screen.txt"));
+    await vi.waitFor(() => expect(pty.written).toContain("\x1b[200~hi\x1b[201~"), {
+      timeout: 3000,
+    });
+    engine.cancel();
+    await turn.done;
+  });
+
+  it("runs a prompt sent while a cancelled turn settles once that turn ends", async () => {
+    const { turn, pty } = await promptPastStartup("first", fixtureText("ready-screen.txt"));
+    engine.cancel();
+    expect(await turn.done).toEqual({ stopReason: "cancelled" });
+    const next = engine.prompt("second");
+    expect(() => engine.prompt("third")).toThrow("Try again when the turn ends");
+    expect(pty.written.join("")).not.toContain("second");
+
+    // The cancelled turn's end; its rows stay out of the next turn.
+    const transcript = fixture("plain-turn");
+    mkdirSync(path.join(root, "-project"));
+    writeFileSync(
+      path.join(root, "-project", `${SESSION_ID}.jsonl`),
+      transcript.map((r) => JSON.stringify(r) + "\n").join(""),
+    );
+    await vi.waitFor(() => expect(pty.written).toContain("\x1b[200~second\x1b[201~"), {
+      timeout: 3000,
+    });
+    engine.cancel();
+    const records: TranscriptRecord[] = [];
+    for await (const record of next.records) {
+      records.push(record);
+    }
+    expect(records).toEqual([]);
+    expect(await next.done).toEqual({ stopReason: "cancelled" });
+  });
+
+  it("fails the turn with the screen when the CLI waits on a screen it can't answer", async () => {
+    engine.dispose();
+    engine = new TuiEngine({
+      cwd: root,
+      sessionId: SESSION_ID,
+      projectsRoot: root,
+      unknownDialogMs: 300,
+    });
+    const { turn, pty } = await promptPastStartup("edit it", fixtureText("ready-screen.txt"));
+    pty.output("Do you want to make this edit?\n ❯ 1. Yes\n   2. No\n");
+    await expect(turn.done).rejects.toThrow(
+      /can't answer\.\n\nScreen:\n[\s\S]*Do you want to make this edit\?/,
+    );
+    expect(pty.written).toContain("\x03");
   });
 });
