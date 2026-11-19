@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LineReader, TranscriptTail, type TranscriptRecord } from "../../tui/transcript.js";
 
 const SESSION_ID = "00000000-0000-4000-8000-000000000001";
@@ -20,28 +20,29 @@ describe("LineReader", () => {
 describe("TranscriptTail", () => {
   let root: string;
   let records: TranscriptRecord[];
-  const file = () => path.join(root, "-project", `${SESSION_ID}.jsonl`);
+  const file = () => path.join(root, "projects", "-project", `${SESSION_ID}.jsonl`);
 
   beforeEach(() => {
     root = mkdtempSync(path.join(tmpdir(), "tui-transcript-"));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", root);
     records = [];
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     rmSync(root, { recursive: true, force: true });
   });
 
   it("finds a transcript created after it starts and reads what is appended", async () => {
     const tail = new TranscriptTail({
       sessionId: SESSION_ID,
-      root,
       onRecord: (r) => records.push(r),
       onError: (error) => {
         throw error;
       },
     });
     await tail.poll();
-    mkdirSync(path.dirname(file()));
+    mkdirSync(path.dirname(file()), { recursive: true });
     writeFileSync(file(), '{"type":"user"}\n{"type":"assi');
     await tail.poll();
     expect(records).toEqual([{ type: "user" }]);
@@ -51,11 +52,10 @@ describe("TranscriptTail", () => {
   });
 
   it("skips what a resumed transcript already holds", async () => {
-    mkdirSync(path.dirname(file()));
+    mkdirSync(path.dirname(file()), { recursive: true });
     writeFileSync(file(), '{"type":"user"}\n');
     const tail = new TranscriptTail({
       sessionId: SESSION_ID,
-      root,
       fromEnd: true,
       onRecord: (r) => records.push(r),
       onError: (error) => {

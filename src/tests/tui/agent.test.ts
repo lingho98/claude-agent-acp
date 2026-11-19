@@ -77,6 +77,8 @@ describe("TuiAcpAgent", () => {
   /** Answers the agent's `session/request_permission`; records each request and its signal. */
   let permissions: Array<{ params: RequestPermissionRequest; signal?: AbortSignal }>;
   let answer: (params: RequestPermissionRequest) => Promise<RequestPermissionResponse>;
+  /** Set: each session update waits for it, as a slow client. */
+  let gate: Promise<void> | undefined;
 
   beforeEach(async () => {
     configDir = mkdtempSync(path.join(tmpdir(), "tui-agent-"));
@@ -85,10 +87,13 @@ describe("TuiAcpAgent", () => {
     engines = [];
     permissions = [];
     answer = async () => ({ outcome: { outcome: "cancelled" } });
+    gate = undefined;
     agent = new TuiAcpAgent(
       {
-        notify: async (_method: string, params: unknown) =>
-          void sent.push(params as SessionNotification),
+        notify: async (_method: string, params: unknown) => {
+          await gate;
+          sent.push(params as SessionNotification);
+        },
         request: async (
           method: string,
           params: RequestPermissionRequest,
@@ -163,8 +168,8 @@ describe("TuiAcpAgent", () => {
       sessionId,
       toolCall: {
         toolCallId: expect.stringMatching(/^dialog-/),
-        title: "Do you want to proceed?",
-        kind: "other",
+        // No kind: Paseo names the request by its kind, else by this title.
+        title: "Bash command: Do you want to proceed?",
         status: "pending",
         content: [{ type: "content", content: { type: "text", text: dialog.excerpt } }],
       },
@@ -181,19 +186,74 @@ describe("TuiAcpAgent", () => {
 
     answer = async () => ({ outcome: { outcome: "cancelled" } });
     expect(await askUser?.(dialog, signal)).toBeUndefined();
+    // A failed request fails the turn in the engine; a withdrawn one is no choice.
     answer = async () => Promise.reject(new Error("connection closed"));
-    expect(await askUser?.(dialog, signal)).toBeUndefined();
+    await expect(askUser?.(dialog, signal)).rejects.toThrow("connection closed");
+    expect(await askUser?.(dialog, AbortSignal.abort())).toBeUndefined();
     engines[0].end({ stopReason: "end_turn" });
     await turn;
+  });
+
+  it("starts no CLI for a prompt that waited on a cancelled turn when the session closes", async () => {
+    const { sessionId } = await agent.newSession({ cwd: "/work", mcpServers: [] });
+    const first = prompt(sessionId, "first");
+    await vi.waitFor(() => expect(engines).toHaveLength(1));
+    // The cancelled turn's last update is still on its way to the client.
+    let release!: () => void;
+    gate = new Promise((resolve) => (release = resolve));
+    engines[0].records = fixture("plain-turn").filter(({ type }) => type === "assistant");
+    await agent.cancel({ sessionId });
+    const second = prompt(sessionId, "second");
+    const close = agent.closeSession({ sessionId });
+    await vi.waitFor(() => expect(engines[0].exited).toBeDefined());
+    engines[0].exited?.();
+    await close;
+    release();
+    expect(await first).toEqual({ stopReason: "cancelled" });
+    expect(await second).toEqual({ stopReason: "cancelled" });
+    expect(engines).toHaveLength(1);
+    expect(engines[0].prompts).toEqual(["first"]);
+  });
+
+  it("sends a resource link as its URI, and refuses an image and an empty prompt", async () => {
+    const { sessionId } = await agent.newSession({ cwd: "/work", mcpServers: [] });
+    const turn = agent.prompt({
+      sessionId,
+      prompt: [
+        { type: "text", text: "read" },
+        { type: "resource_link", uri: "file:///work/a.md", name: "a.md" },
+      ],
+    });
+    await vi.waitFor(() => expect(engines[0]?.prompts).toEqual(["read\nfile:///work/a.md"]));
+    engines[0].end({ stopReason: "end_turn" });
+    await turn;
+
+    await expect(
+      agent.prompt({ sessionId, prompt: [{ type: "image", data: "", mimeType: "image/png" }] }),
+    ).rejects.toThrow("takes text and resource links, not image content");
+    await expect(prompt(sessionId, "  \n ")).rejects.toThrow("The prompt is empty");
+    expect(engines[0].prompts).toHaveLength(1);
+  });
+
+  it("logs that it ignores the client's MCP servers", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await agent.newSession({
+      cwd: "/work",
+      mcpServers: [{ name: "files", command: "/bin/files", args: [], env: [] }],
+    });
+    expect(error).toHaveBeenCalledWith(
+      "[claude-agent-acp] The terminal engine ignores the 1 MCP server(s) the client passed.",
+    );
+    error.mockRestore();
   });
 
   it("resolves session/close and dispose once the CLI exited", async () => {
     const one = await agent.newSession({ cwd: "/work", mcpServers: [] });
     const two = await agent.newSession({ cwd: "/work", mcpServers: [] });
-    for (const { sessionId } of [one, two]) {
+    for (const [index, { sessionId }] of [one, two].entries()) {
       const turn = prompt(sessionId);
-      await vi.waitFor(() => expect(engines.at(-1)?.prompts).toEqual(["hi"]));
-      engines.at(-1)?.end({ stopReason: "end_turn" });
+      await vi.waitFor(() => expect(engines[index]?.prompts).toEqual(["hi"]));
+      engines[index].end({ stopReason: "end_turn" });
       await turn;
     }
     let closed = false;
@@ -328,6 +388,12 @@ describe("TuiAcpAgent", () => {
     expect(engines[0].options).not.toHaveProperty("sessionId");
     engines[0].end({ stopReason: "end_turn" });
     await turn;
+  });
+
+  it("refuses to load a session id that is not a UUID", async () => {
+    await expect(
+      agent.loadSession({ sessionId: "../../etc/passwd", cwd: "/work", mcpServers: [] }),
+    ).rejects.toThrow("Not a session id: ../../etc/passwd");
   });
 
   it("refuses to load a session Claude Code does not have", async () => {

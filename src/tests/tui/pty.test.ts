@@ -14,7 +14,6 @@ describe("buildClaudeArgs", () => {
         sessionId: SESSION_ID,
         model: "claude-haiku-5-5",
         permissionMode: "auto",
-        settingsFile: "/s.json",
       }),
     ).toEqual([
       "--session-id",
@@ -23,8 +22,6 @@ describe("buildClaudeArgs", () => {
       "claude-haiku-5-5",
       "--permission-mode",
       "auto",
-      "--settings",
-      "/s.json",
     ]);
   });
 

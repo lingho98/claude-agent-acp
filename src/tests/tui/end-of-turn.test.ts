@@ -157,10 +157,10 @@ describe("EndOfTurnDetector", () => {
   });
 
   it("waits on the user's answer to a dialog without a stall", () => {
-    detector.waitOnUser(true);
+    detector.waitOnUser({ waiting: true });
     vi.advanceTimersByTime(STALL_MS * 2);
     expect(stalls).toEqual([]);
-    detector.waitOnUser(false);
+    detector.waitOnUser({ waiting: false });
     vi.advanceTimersByTime(STALL_MS);
     expect(stalls).toHaveLength(1);
   });

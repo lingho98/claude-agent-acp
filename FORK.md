@@ -2,7 +2,7 @@
 
 This fork of [agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) adds an opt-in terminal engine (`src/tui/`). It runs each ACP session in the interactive `claude` CLI inside a pseudo-terminal (node-pty), so ACP clients such as Paseo can use Claude Code's Code Mode. Code Mode runs only in the interactive CLI, never through the Agent SDK.
 
-The SDK engine stays the default: unless `CLAUDE_ACP_ENGINE` is exactly `tui`, `src/serve.ts` serves the upstream protocol router. The fork's other shared changes are the `REPL` tool-call reporter (`src/tool-calls/reporters/repl.ts`) and the `node-pty` dependency.
+The SDK engine stays the default: unless `CLAUDE_ACP_ENGINE` is exactly `tui`, `src/serve.ts` serves the upstream protocol router. The fork's other shared changes are the `REPL` tool-call reporter (`src/tool-calls/reporters/repl.ts`) and the optional `node-pty` dependency.
 
 ## Enable
 
@@ -58,19 +58,20 @@ The model ids are the ones the engine advertises. `default` uses the model Claud
 ## Behaviour
 
 - **REPL rows.** A Code Mode REPL call shows as an `execute` row with the JavaScript as its body. It stays in progress until the eval settles, then completes. The tool calls the code makes appear as rows of their own.
-- **Dialogs become prompts.** The folder-trust dialog and tool permission screens go to the client as permission requests (approve or deny in the chat). The bridge never accepts the trust dialog itself: declining it fails the prompt and names the folder, and cancelling the request ends the turn as cancelled. Paseo's per-agent Auto Accept toggle answers these requests too, so with it on, a folder gets trusted without asking. The Code Mode dialog is the one screen the engine answers itself ("Yes").
+- **Dialogs become prompts.** The folder-trust dialog and tool permission screens go to the client as permission requests (approve or deny in the chat), titled with the tool and the question, e.g. "Bash command: Do you want to proceed?". The bridge never accepts the trust dialog itself: declining it fails the prompt and names the folder, and cancelling the request ends the turn as cancelled. Every decline is one Esc, never arrow keys. If the CLI shows a different dialog while you are asked (or the asked one was only model output quoting a dialog), the engine declines what is on screen and fails the turn. Paseo's per-agent Auto Accept toggle answers these requests too, so with it on, a folder gets trusted without asking. The Code Mode dialog is the one screen the engine answers itself ("Yes").
 - **Modes.** `auto` (the default, Claude Code's auto mode) and `default` (asks before edits and commands). Both are passed to the CLI as `--permission-mode`.
 - **Starts at the first prompt.** `session/new` starts no CLI. Mode and model can change until the first prompt; after that a change is refused and needs a new session.
-- **Cancel** interrupts the turn. A dialog open at that moment is answered "No". A prompt sent right after a cancel waits for the cancelled turn to wrap up.
+- **Cancel** interrupts the turn. A dialog open at that moment is declined with Esc. A prompt sent right after a cancel waits for the cancelled turn to wrap up.
 - **Resume.** `session/load` replays the session's transcript, and the next prompt starts the CLI with `--resume`.
-- **Stopped CLI.** If the CLI exits between turns, the next prompt starts a new one on the same session.
+- **Stopped CLI.** If the CLI exits between turns, or the transcript can't be read, the next prompt starts a new one on the same session.
 
 ## Limits
 
-- Tested on macOS only. Linux is untested: node-pty 1.1.0 ships no Linux prebuilds, so run `npm rebuild node-pty` (needs a C++ toolchain). Windows is not supported.
+- Tested on macOS only. Linux is untested: node-pty is an optional dependency and 1.1.0 ships no Linux prebuilds, so if it failed to install, run `npm install node-pty` (it builds from source and needs a C++ toolchain). Windows is not supported.
 - MCP servers the client sends are ignored (a warning is logged). The CLI uses the user's own MCP config.
 - Prompts take text and resource links only (a link becomes its URI). Images and embedded resources are refused.
 - ACP v1 only. A v2 client is negotiated down to v1, and `CLAUDE_AGENT_ACP_PROTOCOL=v2` fails at startup.
+- Paseo 0.16.1 shows DEFAULT MODE `default` in `paseo provider ls` for any custom ACP provider, since it reads no default mode from the agent; sessions still start in `auto`. `paseo permit ls` shows no description for ACP permission requests; the request's title is in the TOOL column.
 - An unrecognised blocking screen fails the turn once the screen and transcript stay unchanged for 30 s. Any CLI output restarts that timer, so while the spinner keeps redrawing it never fires, and the turn hangs until you cancel.
 - Dialog and turn-end detection rely on the screen text and transcript records of Claude Code CLI 2.1.328. A CLI release that changes them can break the engine.
 - npm 11 may skip node-pty's install script, which leaves its `spawn-helper` without the execute bit. The engine makes it executable at first spawn.

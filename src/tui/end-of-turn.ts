@@ -198,7 +198,7 @@ export class EndOfTurnDetector {
   }
 
   /** While `waiting`, the turn waits on the user's answer to a dialog: no stall. */
-  waitOnUser(waiting: boolean): void {
+  waitOnUser({ waiting }: { waiting: boolean }): void {
     if (waiting) {
       this.stall.stop();
     } else if (this.active) {

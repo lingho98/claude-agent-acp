@@ -7,11 +7,9 @@
  * session's first interaction, not at startup.
  */
 
-import { existsSync, readdirSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
-import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { isSessionId, projectsRoot } from "../paths.js";
+import { findTranscript } from "../resumed-session.js";
 
 /** One transcript line, as the CLI writes it. */
 export type TranscriptRecord = {
@@ -26,25 +24,6 @@ export type TranscriptRecord = {
 };
 
 const POLL_MS = 100;
-
-/** The transcript of `sessionId` under `root`, or `undefined` while the CLI has not created it. */
-export function findTranscript(sessionId: string, root = projectsRoot()): string | undefined {
-  if (!isSessionId(sessionId)) {
-    throw new Error(`Not a session id: ${sessionId}`);
-  }
-  let projects: string[];
-  try {
-    projects = readdirSync(root);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return undefined; // No session has run under this config directory yet.
-    }
-    throw error;
-  }
-  return projects
-    .map((project) => path.join(root, project, `${sessionId}.jsonl`))
-    .find((file) => existsSync(file));
-}
 
 /**
  * Splits appended bytes into complete JSON lines. The text after the last
@@ -79,7 +58,6 @@ export type TranscriptTailOptions = {
   onError: (error: Error) => void;
   /** Skip what the file already holds when the tail finds it (a resumed session). */
   fromEnd?: boolean;
-  root?: string;
 };
 
 /**
@@ -129,7 +107,7 @@ export class TranscriptTail {
 
   private async read(): Promise<void> {
     if (!this.file) {
-      this.file = findTranscript(this.options.sessionId, this.options.root);
+      this.file = await findTranscript(this.options.sessionId);
       if (!this.file) {
         return;
       }

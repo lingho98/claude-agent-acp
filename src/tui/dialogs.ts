@@ -15,18 +15,21 @@
  *
  *                                          Esc to cancel · Tab to amend
  *
- * An option is picked with the arrow keys from the cursor's row, then Enter.
- * A screen whose options are not all "Yes…" or "No…" is not read as a
- * dialog. `TuiEngine` fails startup on it after 60 s, and a turn once screen
+ * An option is picked with the arrow keys from the cursor's row, then Enter;
+ * Esc declines (see {@link DECLINE}). The footer is the last thing a dialog
+ * draws: text after it other than a spinner redraw, such as the input box
+ * below model output that quotes a dialog, means no dialog. A screen whose
+ * options are not all "Yes…" or "No…" is not read as a dialog. `TuiEngine` fails startup on it after 60 s, and a turn once screen
  * and transcript stay unchanged for 30 s.
  */
 
+import type { PermissionOptionKind } from "@agentclientprotocol/sdk/unstable";
 import { stripAnsi } from "./pty.js";
 
 export type DialogKind = "trust" | "code-mode" | "permission";
 
 /** The ACP permission option kinds a screen option maps to. */
-export type ChoiceKind = "allow_once" | "allow_always" | "reject_once";
+export type ChoiceKind = Exclude<PermissionOptionKind, "reject_always">;
 
 export type ChoiceOption = {
   label: string;
@@ -50,6 +53,13 @@ export type Dialog = {
 };
 
 const CURSOR = "❯";
+/**
+ * The key that declines a dialog. CLI 2.1.328 rejects a tool permission on
+ * Esc, and exits on it at the trust dialog. Never arrow keys: they move from
+ * the cursor of the dialog the user was asked about, which may not be the one
+ * on screen.
+ */
+export const DECLINE = "\x1b";
 const DOWN = "\x1b[B";
 const UP = "\x1b[A";
 /**
@@ -62,6 +72,11 @@ const FOOTER = /^(Enter to confirm|Esc to cancel)\b/;
 const NUMBERED = /^(❯ )?(\d+)\. (.*)$/;
 /** An unnumbered option's line. */
 const PLAIN_OPTION = /^(❯ ?)?(Yes|No)\b/;
+/**
+ * A line the CLI may write after a dialog's footer: a spinner or timer
+ * redraw, e.g. "⏺", "4" or "· 2s". No letters, no rule, no input box `❯`.
+ */
+const SPINNER_REDRAW = /^[^\p{L}─❯]*(\d+s[^\p{L}─❯]*)?$/u;
 /** A rule across the screen: the top of a tool permission dialog. */
 const RULE = /^─{10,}$/;
 /** Lines {@link Dialog.excerpt} takes at most. */
@@ -84,7 +99,11 @@ export function detectDialog(screen: string): Dialog | undefined {
   while (end >= 0 && !lines[end]) {
     end--;
   }
-  if (footer < 0 || end < 0) {
+  if (
+    footer < 0 ||
+    end < 0 ||
+    !lines.slice(footer + 1).every((line) => SPINNER_REDRAW.test(line))
+  ) {
     return undefined;
   }
   const list = NUMBERED.test(lines[end]) ? numberedList(lines, end) : plainList(lines, end);
@@ -113,6 +132,16 @@ export function detectDialog(screen: string): Dialog | undefined {
     options,
     cursor: cursors.length === 1 ? cursors[0] : undefined,
   };
+}
+
+/** Whether `a` and `b` are one dialog drawn twice: the same question, options and cursor. */
+export function sameDialog(a: Dialog, b: Dialog): boolean {
+  return (
+    a.question === b.question &&
+    a.cursor === b.cursor &&
+    a.options.length === b.options.length &&
+    a.options.every(({ label }, i) => label === b.options[i].label)
+  );
 }
 
 /** Arrow keys from the cursor's row to `option`'s, then Enter; `undefined` when the cursor can't be read. */
@@ -178,7 +207,10 @@ function plainList(lines: string[], end: number): OptionList | undefined {
     label: line.startsWith(CURSOR) ? line.slice(CURSOR.length).trim() : line,
     cursor: line.startsWith(CURSOR),
   }));
-  return rows.length > 1 ? { start, rows } : undefined;
+  if (rows.length < 2) {
+    return undefined;
+  }
+  return { start, rows };
 }
 
 /** "No…" rejects; "Yes…" allows, always when it says "don't ask again"; "mode" switches the permission mode. */

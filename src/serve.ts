@@ -82,7 +82,7 @@ export function acpProtocolRouter(
  * The terminal engine's router. It serves ACP v1 alone, so a v2 client is
  * negotiated down to v1, and `CLAUDE_AGENT_ACP_PROTOCOL=v2` fails at startup.
  */
-function tuiProtocolRouter(
+export function tuiProtocolRouter(
   logger: Logger | undefined,
   onAgent: (agent: AgentHandle) => void,
   protocols: AcpProtocols,

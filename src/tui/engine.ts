@@ -5,19 +5,24 @@
  *
  * Every other dialog `detectDialog` reads (the trust dialog, a tool
  * permission) goes to `askUser`, and the engine picks the option the user
- * chose. The trust dialog is never answered without the user: declining it,
- * or no `askUser`, fails the prompt and names the folder.
+ * chose. Every decline is one Esc ({@link DECLINE}): a "No", a cancel while
+ * the user is asked, a failed or cancelled request, and a dialog that differs
+ * from the one the user is asked about, which fails the turn. The trust
+ * dialog is never answered without the user: declining it, or no `askUser`,
+ * fails the prompt and names the folder.
  */
 
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
   type ChoiceOption,
+  DECLINE,
   detectDialog,
   type Dialog,
   type DialogKind,
   keysFor,
   LINE_BREAK,
+  sameDialog,
   showsInputBox,
 } from "./dialogs.js";
 import { EndOfTurnDetector, QuietTimer, type TurnEndReason } from "./end-of-turn.js";
@@ -39,18 +44,19 @@ export type TuiEngineOptions = Omit<ClaudePtyOptions, "sessionId"> & {
   /** Default: a new UUID, or `resume` when set. */
   sessionId?: string;
   quiescenceMs?: number;
-  stallMs?: number;
   /** Screen and transcript unchanged this long during a turn: `unknown-dialog`, and the turn fails. */
   unknownDialogMs?: number;
-  /** The `projects` directory to find the transcript in. Default: `projectsRoot()`. */
-  projectsRoot?: string;
   /**
    * Asks the user to pick one of `dialog`'s options. Resolves `undefined`
-   * when the user picked none (the client cancelled the request). `signal`
-   * aborts when the turn is cancelled; the engine then answers "No" itself.
+   * when the user picked none (the client cancelled the request), and
+   * rejects when the request failed. `signal` aborts when the engine stops
+   * waiting (a cancel, another dialog); the engine then declines itself.
    */
   askUser?: (dialog: Dialog, signal: AbortSignal) => Promise<ChoiceOption | undefined>;
 };
+
+/** The user's answer: `cancelled` when the engine stopped waiting for it meanwhile. */
+type Answer = { option?: ChoiceOption; error?: Error; cancelled?: boolean };
 
 export type TuiEngineEvents = {
   /** A dialog the engine answered: "Yes" to Code Mode, or the user's choice. */
@@ -105,16 +111,17 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
     this.tail = new TranscriptTail({
       sessionId: this.sessionId,
       fromEnd: options.resume !== undefined,
-      root: options.projectsRoot,
       onRecord: (record) => this.onRecord(record),
-      onError: (error) =>
+      onError: (error) => {
         this.endTurn(
           new Error(`Could not read the session transcript: ${error.message}`, { cause: error }),
-        ),
+        );
+        // The tail stopped for good: the next prompt starts a new CLI that resumes the session.
+        void this.dispose();
+      },
     });
     this.detector = new EndOfTurnDetector({
       quiescenceMs: options.quiescenceMs,
-      stallMs: options.stallMs,
       onEnd: ({ reason, record }) => this.endTurn({ stopReason: reason, record }),
       onStall: (error) => this.endTurn(error),
     });
@@ -200,7 +207,7 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
     return (
       this.spawning?.then(
         (pty) => pty.dispose(),
-        () => {},
+        () => {}, // No CLI to stop; `start` reports the failed spawn.
       ) ?? Promise.resolve()
     );
   }
@@ -238,8 +245,7 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
       // The CLI waits on the dialog: a Ctrl+C, then Esc, would land on the input box after it.
       this.asking = undefined;
       asking.controller.abort();
-      const no = asking.dialog.options.find(({ kind }) => kind === "reject_once");
-      this.pty?.write((no && keysFor(asking.dialog, no)) ?? "\x1b");
+      this.pty?.write(DECLINE);
     } else {
       this.pty?.interrupt(() => this.turn === turn);
     }
@@ -370,28 +376,24 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
           );
         } else if (dialog.kind !== "code-mode" && askUser) {
           clearTimeout(timeout);
-          void this.ask(dialog, askUser).then(({ option, cancelled }) => {
-            if (!cancelled && !option) {
-              // The client cancelled the request: a cancel of the prompt, which answers "No" while `asking` is set.
+          void this.ask(dialog, askUser).then(({ option, error, cancelled }) => {
+            if (!cancelled && !error && !option) {
+              // The client cancelled the request: a cancel of the prompt, which declines while `asking` is set.
               this.cancel();
+            } else if (!cancelled) {
+              this.asking = undefined;
             }
-            this.asking = undefined;
             if (settled) {
               return;
             }
-            if (cancelled || !option) {
+            if (cancelled || (!error && !option)) {
+              // `interrupt` or the other-dialog check declined it.
               finish(new Error("The prompt was cancelled while Claude Code asked about a dialog."));
-            } else if (option.kind === "reject_once") {
+            } else if (error || option?.kind === "reject_once") {
+              pty.write(DECLINE);
               // Settled before the CLI's exit: its "exited with code" error must not win.
-              finish(
-                dialog.kind === "trust"
-                  ? new Error(
-                      `You declined to trust the folder ${this.options.cwd}, so Claude Code can't work in it. ` +
-                        "Send a prompt again to be asked again.",
-                    )
-                  : new Error(`You declined "${dialog.question}" as the Claude CLI started.`),
-              );
-            } else {
+              finish(error ?? declined(dialog, this.options.cwd));
+            } else if (option) {
               armTimeout();
               answer(dialog, option);
             }
@@ -403,7 +405,19 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
       });
       armTimeout();
       pty.onData(() => {
-        if (settled || this.asking) {
+        if (settled) {
+          return;
+        }
+        const asking = this.asking;
+        if (asking) {
+          const shown = detectDialog(pty.screenSince(mark));
+          if (shown && !sameDialog(shown, asking.dialog)) {
+            this.asking = undefined;
+            asking.controller.abort();
+            pty.write(DECLINE);
+            this.emit("unknown-dialog", pty.screen());
+            finish(otherDialog(asking.dialog, pty.screen()));
+          }
           return;
         }
         if (quiet.running) {
@@ -421,15 +435,25 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
   /**
    * Asks the user about a dialog the CLI shows mid-turn, and answers it. The
    * unknown-dialog and stall watchdogs wait while the user decides. No choice
-   * cancels the turn, answering "No" (see {@link interrupt}).
+   * cancels the turn, and a failed request fails it, both declining (see
+   * {@link interrupt}). Another dialog while the user is asked fails the turn:
+   * the asked one is gone, or was never a dialog (model output that quotes one).
    */
   private relayDialog(pty: ClaudePty): void {
     const turn = this.turn;
-    if (!turn || turn.cancelled || this.dialogMark === undefined || this.asking) {
+    if (!turn || turn.cancelled || this.dialogMark === undefined) {
       return;
     }
     const dialog = detectDialog(pty.screenSince(this.dialogMark));
     if (!dialog) {
+      return;
+    }
+    const asking = this.asking;
+    if (asking) {
+      if (!sameDialog(dialog, asking.dialog)) {
+        this.emit("unknown-dialog", pty.screen());
+        this.interrupt(otherDialog(asking.dialog, pty.screen()));
+      }
       return;
     }
     this.dialogMark = pty.mark();
@@ -445,38 +469,52 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
       return;
     }
     this.unknownDialog.stop();
-    this.detector.waitOnUser(true);
-    void this.ask(dialog, askUser).then(({ option, cancelled }) => {
+    this.detector.waitOnUser({ waiting: true });
+    void this.ask(dialog, askUser).then(({ option, error, cancelled }) => {
       if (cancelled || this.turn !== turn) {
         return;
       }
+      if (error) {
+        // While `asking` is set, `interrupt` declines the dialog.
+        this.interrupt(error);
+        return;
+      }
       if (!option) {
-        // While `asking` is set, the cancel answers the dialog "No".
         this.cancel();
         return;
       }
       this.asking = undefined;
       this.dialogMark = pty.mark();
-      pty.write(keysFor(dialog, option) ?? ""); // The cursor was read above.
+      // The cursor was read above. A "No" ends the turn: the CLI writes its interruption row.
+      pty.write(option.kind === "reject_once" ? DECLINE : (keysFor(dialog, option) ?? ""));
       this.emit("dialog", dialog.kind);
-      this.detector.waitOnUser(false);
+      this.detector.waitOnUser({ waiting: false });
       this.unknownDialog.start();
     });
   }
 
   /**
    * Asks `askUser` about `dialog`, kept in {@link asking} until the caller
-   * clears it. `cancelled`: {@link interrupt} or the turn's end answered or
-   * dropped the dialog meanwhile. A failed request is no choice.
+   * clears it. `cancelled`: {@link interrupt}, the other-dialog check or the
+   * turn's end declined or dropped the dialog meanwhile, so a late answer,
+   * or the failure the abort caused, is not the user's.
    */
   private async ask(
     dialog: Dialog,
     askUser: NonNullable<TuiEngineOptions["askUser"]>,
-  ): Promise<{ option?: ChoiceOption; cancelled: boolean }> {
+  ): Promise<Answer> {
     const asking = { dialog, controller: new AbortController() };
     this.asking = asking;
-    const option = await askUser(dialog, asking.controller.signal).catch(() => undefined);
-    return this.asking === asking ? { option, cancelled: false } : { cancelled: true };
+    try {
+      const option = await askUser(dialog, asking.controller.signal);
+      return this.asking === asking ? { option } : { cancelled: true };
+    } catch (error) {
+      if (this.asking !== asking) {
+        return { cancelled: true };
+      }
+      const message = `The permission request for "${dialog.question}" failed: ${(error as Error).message}`;
+      return { error: new Error(message, { cause: error }) };
+    }
   }
 
   private onRecord(record: TranscriptRecord): void {
@@ -529,6 +567,25 @@ function settle(turn: Turn, outcome: TurnResult | Error): void {
     turn.resolve(outcome);
   }
   close(turn);
+}
+
+/** The startup error of a dialog the user declined. */
+function declined(dialog: Dialog, cwd: string): Error {
+  return dialog.kind === "trust"
+    ? new Error(
+        `You declined to trust the folder ${cwd}, so Claude Code can't work in it. ` +
+          "Send a prompt again to be asked again.",
+      )
+    : new Error(`You declined "${dialog.question}" as the Claude CLI started.`);
+}
+
+/** The error of a dialog that replaced the one the user was asked about. */
+function otherDialog(asked: Dialog, screen: string): Error {
+  return withScreen(
+    `The Claude CLI showed another dialog while you were asked "${asked.question}", ` +
+      "so the adapter declined it. Send the prompt again.",
+    screen,
+  );
 }
 
 /** `message` with the last lines of `screen` (the CLI's recent output) that are not blank. */

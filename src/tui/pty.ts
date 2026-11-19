@@ -8,8 +8,8 @@
  *
  * Mac and Linux only: node-pty's Windows backend (ConPTY) is not supported in
  * v0.1, and on Linux node-pty must be built from source (see `loadNodePty`).
- * node-pty is imported lazily on the first spawn, so the SDK engine and
- * `build:binary` never load the native module.
+ * node-pty is an optional dependency, imported lazily on the first spawn, so
+ * the SDK engine and `build:binary` never load the native module.
  */
 
 import { existsSync, constants as fsConstants } from "node:fs";
@@ -65,9 +65,6 @@ export type ClaudePtyOptions = {
   /** Set at spawn: a later `/model` write merged with the first prompt in claude-agent-tui. */
   model?: string;
   permissionMode?: string;
-  settingsFile?: string;
-  /** The CLI to run. Default: `claude` on `PATH`. */
-  executable?: string;
   env?: Record<string, string | undefined>;
 };
 
@@ -79,9 +76,6 @@ export function buildClaudeArgs(options: ClaudePtyOptions): string[] {
   }
   if (options.permissionMode) {
     args.push("--permission-mode", options.permissionMode);
-  }
-  if (options.settingsFile) {
-    args.push("--settings", options.settingsFile);
   }
   return args;
 }
@@ -140,9 +134,9 @@ function loadNodePty(): Promise<typeof import("node-pty")> {
       // ponytail: no node-gyp handling for Linux in v0.1; node-pty 1.1.0 ships prebuilds for macOS and Windows only.
       // ponytail: `build:binary` bundles no node-pty; ship it in the binary if the terminal engine needs one.
       throw new Error(
-        `Could not load node-pty (${(error as Error).message}). The terminal engine needs the npm install ` +
-          "(`node dist/index.js`), not the compiled binary. On Linux node-pty has no prebuilt binary: " +
-          "build it with `npm rebuild node-pty`, or allow its install script.",
+        `Could not load node-pty (${(error as Error).message}). The terminal engine needs this optional ` +
+          "dependency: run `npm install node-pty` (on Linux it builds from source and needs a C++ toolchain). " +
+          "It also needs the npm install (`node dist/index.js`), not the compiled binary.",
         { cause: error },
       );
     }
@@ -217,7 +211,7 @@ export class ClaudePty {
 
   static async spawn(options: ClaudePtyOptions): Promise<ClaudePty> {
     const { spawn } = await loadNodePty();
-    const pty = spawn(options.executable ?? "claude", buildClaudeArgs(options), {
+    const pty = spawn("claude", buildClaudeArgs(options), {
       name: "xterm-256color",
       cols: PTY_COLS,
       rows: PTY_ROWS,
@@ -300,7 +294,13 @@ export class ClaudePty {
         resolve();
         return;
       }
-      const kill = setTimeout(() => this.pty.kill("SIGKILL"), EXIT_GRACE_MS);
+      const kill = setTimeout(() => {
+        try {
+          this.pty.kill("SIGKILL");
+        } catch {
+          // node-pty's Windows backend takes no signal, and throws.
+        }
+      }, EXIT_GRACE_MS);
       this.onExit(() => {
         clearTimeout(kill);
         resolve();

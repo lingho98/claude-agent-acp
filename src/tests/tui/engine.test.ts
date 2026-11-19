@@ -9,6 +9,10 @@ import { fixture, fixtureText } from "./fixture.js";
 
 const SESSION_ID = "00000000-0000-4000-8000-000000000001";
 const DOWN = "\x1b[B";
+const ESC = "\x1b";
+// Model output that quotes a dialog, e.g. from a file the model read; the CLI does not wait on it.
+const QUOTED_DIALOG =
+  "\r\n⏺ The README says:\r\n\r\n  Do you want to proceed?\r\n  ❯ 1. Yes\r\n    2. No\r\n\r\n  Esc to cancel\r\n";
 // Built from the text quoted in the task; no capture of this dialog exists yet (see dialogs.test.ts).
 const CODE_MODE_SCREEN =
   "Code Mode is experimental.\n  ❯ No, start without it \n Yes, turn on Code Mode\n\n  Enter to confirm";
@@ -71,30 +75,21 @@ describe("TuiEngine", () => {
 
   beforeEach(() => {
     root = mkdtempSync(path.join(tmpdir(), "tui-engine-"));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", root);
     fake.ptys.length = 0;
-    engine = new TuiEngine({
-      cwd: root,
-      sessionId: SESSION_ID,
-      projectsRoot: root,
-      quiescenceMs: 50,
-    });
+    engine = new TuiEngine({ cwd: root, sessionId: SESSION_ID, quiescenceMs: 50 });
   });
 
   afterEach(() => {
     engine.dispose();
+    vi.unstubAllEnvs();
     rmSync(root, { recursive: true, force: true });
   });
 
   /** Replaces the engine with one whose `askUser` is the test's. */
   function engineWith(askUser: NonNullable<TuiEngineOptions["askUser"]>) {
     void engine.dispose();
-    engine = new TuiEngine({
-      cwd: root,
-      sessionId: SESSION_ID,
-      projectsRoot: root,
-      quiescenceMs: 50,
-      askUser,
-    });
+    engine = new TuiEngine({ cwd: root, sessionId: SESSION_ID, quiescenceMs: 50, askUser });
   }
 
   /** An `askUser` the test answers: `next()` waits for the next question. */
@@ -115,10 +110,12 @@ describe("TuiEngine", () => {
     return { askUser, questions, next };
   }
 
+  const transcriptFile = () => path.join(root, "projects", "-project", `${SESSION_ID}.jsonl`);
+
   function writeTranscript(name: string) {
-    mkdirSync(path.join(root, "-project"), { recursive: true });
+    mkdirSync(path.dirname(transcriptFile()), { recursive: true });
     writeFileSync(
-      path.join(root, "-project", `${SESSION_ID}.jsonl`),
+      transcriptFile(),
       fixture(name)
         .map((r) => JSON.stringify(r) + "\n")
         .join(""),
@@ -157,18 +154,15 @@ describe("TuiEngine", () => {
     expect(() => engine.prompt("again")).toThrow("Try again when the turn ends");
 
     const transcript = fixture("plain-turn");
-    mkdirSync(path.join(root, "-project"));
-    writeFileSync(
-      path.join(root, "-project", `${SESSION_ID}.jsonl`),
-      transcript.map((r) => JSON.stringify(r) + "\n").join(""),
-    );
+    writeTranscript("plain-turn");
     const records: TranscriptRecord[] = [];
     for await (const record of turn.records) {
       records.push(record);
     }
     expect(records).toEqual(transcript);
     expect(await turn.done).toEqual({ stopReason: "turn_duration", record: transcript.at(-1) });
-    await vi.waitFor(() => expect(pty.written).toContain("\r"));
+    // A turn that ended by itself is not interrupted.
+    expect(pty.written).not.toContain("\x03");
 
     const next = engine.prompt("long task");
     await vi.waitFor(() => expect(pty.written).toContain("\x1b[200~long task\x1b[201~"));
@@ -229,12 +223,7 @@ describe("TuiEngine", () => {
     expect(pty.written.join("")).not.toContain("second");
 
     // The cancelled turn's end; its rows stay out of the next turn.
-    const transcript = fixture("plain-turn");
-    mkdirSync(path.join(root, "-project"));
-    writeFileSync(
-      path.join(root, "-project", `${SESSION_ID}.jsonl`),
-      transcript.map((r) => JSON.stringify(r) + "\n").join(""),
-    );
+    writeTranscript("plain-turn");
     await vi.waitFor(() => expect(pty.written).toContain("\x1b[200~second\x1b[201~"), {
       timeout: 3000,
     });
@@ -249,12 +238,7 @@ describe("TuiEngine", () => {
 
   it("fails the turn with the screen when the CLI waits on a screen it can't answer", async () => {
     engine.dispose();
-    engine = new TuiEngine({
-      cwd: root,
-      sessionId: SESSION_ID,
-      projectsRoot: root,
-      unknownDialogMs: 300,
-    });
+    engine = new TuiEngine({ cwd: root, sessionId: SESSION_ID, unknownDialogMs: 300 });
     const { turn, pty } = await promptPastStartup("edit it", fixtureText("ready-screen.txt"));
     pty.output("Do you want to make this edit?\n ❯ 1. Yes\n   2. No\n");
     await expect(turn.done).rejects.toThrow(
@@ -295,11 +279,39 @@ describe("TuiEngine", () => {
     pty.output(fixtureText("trust-screen.txt"));
     (await user.next(1)).choose((options) => options.find(({ kind }) => kind === "reject_once"));
     await expect(turn.done).rejects.toThrow(`You declined to trust the folder ${root}`);
-    expect(pty.written).toEqual([]);
+    expect(pty.written).toEqual([ESC]);
     expect(engine.stopped).toBe(true);
   });
 
-  it("answers the trust dialog No and ends the turn cancelled when the client cancels the request", async () => {
+  it("declines the trust dialog with Esc and fails startup when the request fails", async () => {
+    engineWith(async () => Promise.reject(new Error("connection closed")));
+    const turn = engine.prompt("hi");
+    await vi.waitFor(() => expect(fake.ptys).toHaveLength(1));
+    const pty = fake.ptys[0];
+    pty.output(fixtureText("trust-screen.txt"));
+    await expect(turn.done).rejects.toThrow(
+      'The permission request for "Quick safety check: Is this a project you created or one you trust?" failed: connection closed',
+    );
+    expect(pty.written).toEqual([ESC]);
+  });
+
+  it("declines the trust dialog and fails startup when another dialog replaces it", async () => {
+    const user = userAsked();
+    engineWith(user.askUser);
+    const turn = engine.prompt("hi");
+    await vi.waitFor(() => expect(fake.ptys).toHaveLength(1));
+    const pty = fake.ptys[0];
+    pty.output(fixtureText("trust-screen.txt"));
+    const asked = await user.next(1);
+    pty.output(fixtureText("tool-bash-screen.txt"));
+    await expect(turn.done).rejects.toThrow(/showed another dialog while you were asked/);
+    expect(asked.signal.aborted).toBe(true);
+    asked.choose((options) => options.find(({ kind }) => kind === "allow_once"));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(pty.written).toEqual([ESC]);
+  });
+
+  it("declines the trust dialog and ends the turn cancelled when the client cancels the request", async () => {
     const user = userAsked();
     engineWith(user.askUser);
     const turn = engine.prompt("hi");
@@ -308,8 +320,7 @@ describe("TuiEngine", () => {
     pty.output(fixtureText("trust-screen.txt"));
     (await user.next(1)).choose(() => undefined);
     expect(await turn.done).toEqual({ stopReason: "cancelled" });
-    // The cursor is on "No, exit".
-    expect(pty.written).toEqual(["\r"]);
+    expect(pty.written).toEqual([ESC]);
     await vi.waitFor(() => expect(engine.stopped).toBe(true));
   });
 
@@ -321,15 +332,16 @@ describe("TuiEngine", () => {
     pty.output(fixtureText("tool-bash-screen.txt"));
     const first = await user.next(1);
     expect(first.dialog).toMatchObject({ kind: "permission", question: "Do you want to proceed?" });
-    // The spinner keeps drawing under the dialog: one question, not one per redraw.
+    // The spinner keeps drawing under the dialog, and the dialog is drawn again: one question.
     pty.output("  ⏺    \r   4    \r");
+    pty.output(fixtureText("tool-bash-screen.txt"));
     first.choose((options) => options.find(({ kind }) => kind === "allow_always"));
-    await vi.waitFor(() => expect(pty.written.slice(sent)).toContain(DOWN + "\r"));
+    await vi.waitFor(() => expect(pty.written.slice(sent)).toEqual([DOWN + "\r"]));
     expect(user.questions).toHaveLength(1);
 
     pty.output(fixtureText("tool-bash-screen.txt"));
     (await user.next(2)).choose((options) => options.find(({ kind }) => kind === "reject_once"));
-    await vi.waitFor(() => expect(pty.written).toContain(DOWN.repeat(3) + "\r"));
+    await vi.waitFor(() => expect(pty.written.slice(sent)).toEqual([DOWN + "\r", ESC]));
     // The CLI ends the turn on "No" with an interruption row and nothing more.
     writeTranscript("rejected-turn");
     expect(await turn.done).toMatchObject({ stopReason: "interrupted" });
@@ -339,7 +351,7 @@ describe("TuiEngine", () => {
   it.each([
     ["the prompt is cancelled", "cancel"],
     ["the client cancels the request", "no choice"],
-  ])("answers No and ends the turn cancelled when %s", async (_name, how) => {
+  ])("declines with Esc and ends the turn cancelled when %s", async (_name, how) => {
     const user = userAsked();
     engineWith(user.askUser);
     const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));
@@ -353,11 +365,61 @@ describe("TuiEngine", () => {
       asked.choose(() => undefined);
     }
     expect(await turn.done).toEqual({ stopReason: "cancelled" });
-    await vi.waitFor(() => expect(pty.written.slice(sent)).toEqual([DOWN.repeat(3) + "\r"]));
-    // A late answer writes nothing, and no Ctrl+C or Esc lands on the input box.
+    await vi.waitFor(() => expect(pty.written.slice(sent)).toEqual([ESC]));
+    // A late answer writes nothing, and no Ctrl+C or second Esc lands on the input box.
     asked.choose((options) => options[0]);
     await new Promise((resolve) => setTimeout(resolve, 1200));
-    expect(pty.written.slice(sent)).toEqual([DOWN.repeat(3) + "\r"]);
+    expect(pty.written.slice(sent)).toEqual([ESC]);
+  });
+
+  it.each([
+    ["the user answers the quoted one No", "no"],
+    ["the prompt is cancelled", "cancel"],
+  ])(
+    "declines a real dialog drawn while a quoted one is asked, with Esc alone, when %s",
+    async (_name, how) => {
+      const user = userAsked();
+      engineWith(user.askUser);
+      const { turn, pty } = await promptPastStartup("summarize", fixtureText("ready-screen.txt"));
+      const sent = pty.written.length;
+      pty.output(QUOTED_DIALOG);
+      const quoted = await user.next(1);
+      expect(quoted.dialog.options.map(({ label }) => label)).toEqual(["Yes", "No"]);
+
+      pty.output(fixtureText("tool-bash-screen.txt"));
+      await expect(turn.done).rejects.toThrow(
+        /showed another dialog while you were asked "Do you want to proceed\?"[\s\S]*Screen:/,
+      );
+      expect(quoted.signal.aborted).toBe(true);
+      if (how === "no") {
+        quoted.choose((options) => options.find(({ kind }) => kind === "reject_once"));
+      } else {
+        engine.cancel();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      expect(pty.written.slice(sent)).toEqual([ESC]);
+      expect(user.questions).toHaveLength(1);
+    },
+  );
+
+  it("declines with Esc and fails the turn when the permission request fails", async () => {
+    engineWith(async () => Promise.reject(new Error("connection closed")));
+    const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));
+    const sent = pty.written.length;
+    pty.output(fixtureText("tool-bash-screen.txt"));
+    await expect(turn.done).rejects.toThrow(
+      'The permission request for "Do you want to proceed?" failed: connection closed',
+    );
+    expect(pty.written.slice(sent)).toEqual([ESC]);
+  });
+
+  it("fails the turn and stops the CLI when the transcript can't be read", async () => {
+    const { turn } = await promptPastStartup("hi", fixtureText("ready-screen.txt"));
+    // A directory where the transcript should be: found, but every read fails.
+    mkdirSync(transcriptFile(), { recursive: true });
+    await expect(turn.done).rejects.toThrow("Could not read the session transcript");
+    await vi.waitFor(() => expect(engine.stopped).toBe(true));
+    expect(() => engine.prompt("again")).toThrow("Start a new session");
   });
 
   it("waits for the CLI to exit on dispose and kills it after 3 s", { timeout: 8000 }, async () => {

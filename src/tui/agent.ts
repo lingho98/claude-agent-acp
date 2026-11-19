@@ -46,12 +46,14 @@ import {
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { Logger } from "../logger.js";
+import { isSessionId } from "../paths.js";
+import { findTranscript } from "../resumed-session.js";
 import { DEFAULT_MODEL_ID } from "../session-config-ids.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
 import type { ChoiceOption, Dialog } from "./dialogs.js";
 import { TuiEngine, type TuiEngineOptions } from "./engine.js";
 import { TranscriptToAcp } from "./transcript-to-acp.js";
-import { findTranscript, LineReader } from "./transcript.js";
+import { LineReader } from "./transcript.js";
 import packageJson from "../../package.json" with { type: "json" };
 
 /** The permission mode a session starts in. */
@@ -129,18 +131,21 @@ export class TuiAcpAgent {
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     this.warnMcpServers(params.mcpServers);
     const session = this.openSession(randomUUID(), params.cwd);
-    return { sessionId: session.id, modes: modes(session), configOptions: configOptions(session) };
+    return {
+      sessionId: session.id,
+      modes: modes(session.mode),
+      configOptions: configOptions(session.model),
+    };
   }
 
   /** Replays the session's transcript; the CLI resumes the session at the next prompt. */
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     this.warnMcpServers(params.mcpServers);
-    let file: string | undefined;
-    try {
-      file = findTranscript(params.sessionId);
-    } catch (error) {
-      throw RequestError.invalidParams(undefined, (error as Error).message);
+    // The id names a file: only a session id may.
+    if (!isSessionId(params.sessionId)) {
+      throw RequestError.invalidParams(undefined, `Not a session id: ${params.sessionId}`);
     }
+    const file = await findTranscript(params.sessionId);
     if (!file) {
       throw RequestError.invalidParams(
         undefined,
@@ -153,14 +158,14 @@ export class TuiAcpAgent {
       await this.send(session.adapter.updates(record, { replay: true }));
     }
     await this.send(session.adapter.endTurn());
-    return { modes: modes(session), configOptions: configOptions(session) };
+    return { modes: modes(session.mode), configOptions: configOptions(session.model) };
   }
 
-  /** Resolves once the session's CLI exited. */
+  /** Resolves once the session's CLI exited. A prompt that waits to run does not run. */
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
-    const engine = this.sessions.get(params.sessionId)?.engine;
+    const session = this.sessions.get(params.sessionId);
     this.sessions.delete(params.sessionId);
-    await engine?.dispose();
+    await stop(session);
     return {};
   }
 
@@ -171,6 +176,9 @@ export class TuiAcpAgent {
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = this.session(params.sessionId);
     const text = promptText(params.prompt);
+    if (!text.trim()) {
+      throw RequestError.invalidParams(undefined, "The prompt is empty. Send some text.");
+    }
     const previous = session.turn;
     if (previous && !previous.cancelled) {
       throw RequestError.invalidRequest(
@@ -241,14 +249,14 @@ export class TuiAcpAgent {
       );
     }
     session.model = params.value;
-    return { configOptions: configOptions(session) };
+    return { configOptions: configOptions(session.model) };
   }
 
   /** Resolves once every session's CLI exited. */
   async dispose(): Promise<void> {
-    const engines = [...this.sessions.values()].map(({ engine }) => engine?.dispose());
+    const sessions = [...this.sessions.values()];
     this.sessions.clear();
-    await Promise.all(engines);
+    await Promise.all(sessions.map(stop));
   }
 
   private async runTurn(session: TuiSession, text: string, turn: Turn): Promise<PromptResponse> {
@@ -259,7 +267,11 @@ export class TuiAcpAgent {
     if (session.engine?.stopped) {
       session.engine = undefined;
     }
-    const engine = (session.engine ??= this.startEngine(session));
+    const engine = (session.engine ??= await this.startEngine(session));
+    // Cancelled or closed while the transcript was looked up; the engine spawns at its first prompt.
+    if (turn.cancelled) {
+      return { stopReason: "cancelled" };
+    }
     let tuiTurn;
     try {
       tuiTurn = engine.prompt(text);
@@ -287,8 +299,8 @@ export class TuiAcpAgent {
   }
 
   /** A CLI for `session`: it resumes the session once the CLI wrote its transcript. */
-  private startEngine(session: TuiSession): TuiEngineLike {
-    const resume = findTranscript(session.id) !== undefined;
+  private async startEngine(session: TuiSession): Promise<TuiEngineLike> {
+    const resume = (await findTranscript(session.id)) !== undefined;
     return this.createEngine({
       cwd: session.cwd,
       ...(resume ? { resume: session.id } : { sessionId: session.id }),
@@ -300,9 +312,12 @@ export class TuiAcpAgent {
 
   /**
    * Sends `dialog` to the client as a permission request: the screen's
-   * question as the title, the lines above its options as the content, one
-   * permission option per screen option. Resolves the option the client
-   * chose, or `undefined` when it cancelled. `signal` withdraws the request.
+   * question as the title, after a tool permission's tool line ("Bash
+   * command: Do you want to proceed?"), the lines above its options as the
+   * content, one permission option per screen option. No `kind`: Paseo names
+   * the request by its kind, else its title. Resolves the option the client
+   * chose, or `undefined` when it cancelled; rejects when the request failed.
+   * `signal` withdraws the request.
    */
   private async askUser(
     session: TuiSession,
@@ -313,8 +328,7 @@ export class TuiAcpAgent {
       sessionId: session.id,
       toolCall: {
         toolCallId: `dialog-${randomUUID()}`,
-        title: dialog.question,
-        kind: "other",
+        title: requestTitle(dialog),
         status: "pending",
         content: [{ type: "content", content: { type: "text", text: dialog.excerpt } }],
       },
@@ -324,23 +338,23 @@ export class TuiAcpAgent {
         kind,
       })),
     };
+    let outcome;
     try {
-      const { outcome } = await this.client.request(
-        methods.client.session.requestPermission,
-        request,
-        { cancellationSignal: signal, stopWaitingOnCancel: true },
-      );
-      return outcome.outcome === "selected"
-        ? dialog.options.find(({ row }) => String(row) === outcome.optionId)
-        : undefined;
+      ({ outcome } = await this.client.request(methods.client.session.requestPermission, request, {
+        cancellationSignal: signal,
+        stopWaitingOnCancel: true,
+      }));
     } catch (error) {
-      if (!signal.aborted) {
-        this.logger.error(
-          `[claude-agent-acp] The permission request for "${dialog.question}" failed: ${(error as Error).message}`,
-        );
+      // Withdrawn: the engine no longer waits for an answer.
+      if (signal.aborted) {
+        return undefined;
       }
+      throw error;
+    }
+    if (outcome.outcome !== "selected") {
       return undefined;
     }
+    return dialog.options.find(({ row }) => String(row) === outcome.optionId);
   }
 
   private openSession(id: string, cwd: string): TuiSession {
@@ -390,24 +404,38 @@ export class TuiAcpAgent {
   }
 }
 
-function modes(session: TuiSession): SessionModeState {
-  return { currentModeId: session.mode, availableModes: MODES };
+/** Marks the session's waiting prompt cancelled, so it starts no CLI, and stops its CLI. */
+async function stop(session: TuiSession | undefined): Promise<void> {
+  if (session?.turn) {
+    session.turn.cancelled = true;
+  }
+  await session?.engine?.dispose();
 }
 
-function configOptions(session: TuiSession): SessionConfigOption[] {
-  const known = MODEL_CHOICES.some((choice) => choice.value === session.model);
+function modes(currentModeId: string): SessionModeState {
+  return { currentModeId, availableModes: MODES };
+}
+
+function configOptions(model: string): SessionConfigOption[] {
+  const known = MODEL_CHOICES.some((choice) => choice.value === model);
   return [
     {
       id: MODEL_CONFIG_ID,
       name: "Model",
       category: "model",
       type: "select",
-      currentValue: session.model,
-      options: known
-        ? MODEL_CHOICES
-        : [...MODEL_CHOICES, { value: session.model, name: session.model }],
+      currentValue: model,
+      options: known ? MODEL_CHOICES : [...MODEL_CHOICES, { value: model, name: model }],
     },
   ];
+}
+
+/** A tool permission's first line, e.g. "Bash command", then the question: Paseo shows 20 characters of it as the tool. */
+function requestTitle(dialog: Dialog): string {
+  const lines = dialog.excerpt.split("\n");
+  return dialog.kind === "permission" && lines.length > 1
+    ? `${lines[0]}: ${dialog.question}`
+    : dialog.question;
 }
 
 /** The prompt as the text the CLI gets. A resource link becomes its URI. */

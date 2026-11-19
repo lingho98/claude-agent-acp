@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { detectDialog, keysFor, showsInputBox, type Dialog } from "../../tui/dialogs.js";
+import {
+  detectDialog,
+  keysFor,
+  sameDialog,
+  showsInputBox,
+  type Dialog,
+} from "../../tui/dialogs.js";
 import { fixtureText } from "./fixture.js";
 
 const DOWN = "\x1b[B";
@@ -136,8 +142,24 @@ describe("detectDialog", () => {
     ],
     ["a list with no footer", "Do you want to make this edit?\n ❯ 1. Yes\n   2. No\n"],
     ["a list numbered from 2", "Proceed?\n ❯ 2. Yes\n   3. No\n\n Esc to cancel"],
+    [
+      "model output that quotes a dialog, above the input box",
+      "⏺ The README says:\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n\n  Esc to cancel\n" +
+        fixtureText("ready-screen.txt"),
+    ],
+    ["a dialog with text drawn after its footer", TRUST_SCREEN + "\n✻ Thinking…\n"],
   ])("finds no dialog on %s", (_name, screen) => {
     expect(detectDialog(screen)).toBeUndefined();
+  });
+});
+
+describe("sameDialog", () => {
+  it("matches a redraw and tells another dialog or a moved cursor apart", () => {
+    const bash = dialogOf(BASH_SCREEN);
+    expect(sameDialog(bash, dialogOf(BASH_SCREEN))).toBe(true);
+    expect(sameDialog(bash, dialogOf(WRITE_SCREEN))).toBe(false);
+    const moved = BASH_SCREEN.replace("❯  1.", "   1.").replace("    4.  No", " ❯  4.  No");
+    expect(sameDialog(bash, dialogOf(moved))).toBe(false);
   });
 });
 
