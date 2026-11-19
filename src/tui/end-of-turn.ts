@@ -18,6 +18,9 @@
  *   which the CLI writes as `isVirtual` `<synthetic>` `stop_sequence` rows
  *   that hold a `tool_use`. The model's real `end_turn` follows them, in run
  *   4 1.6 s later.
+ * - A user row "[Request interrupted by user…" ends the turn after
+ *   quiescence: the CLI writes it, and nothing more, when the user answers a
+ *   tool permission "No" or interrupts the turn.
  * - Sidechain (subagent) rows never end the parent turn.
  */
 
@@ -26,11 +29,32 @@ import type { TranscriptRecord } from "./transcript.js";
 export const QUIESCENCE_MS = 1500;
 export const STALL_MS = 120_000;
 
-export type TurnEndReason = "turn_duration" | "end_turn" | "max_tokens" | "api_error";
+export type TurnEndReason =
+  "turn_duration" | "end_turn" | "max_tokens" | "api_error" | "interrupted";
 
 export type TurnEnd = { reason: TurnEndReason; record: TranscriptRecord };
 
 const SYNTHETIC_MODEL = "<synthetic>";
+const INTERRUPTED = "[Request interrupted by user";
+
+/** Whether `record` is the CLI's "[Request interrupted by user…]" row, as a string or a text block. */
+function isInterruption(record: TranscriptRecord): boolean {
+  const content = record.message?.content;
+  if (typeof content === "string") {
+    return content.startsWith(INTERRUPTED);
+  }
+  return (
+    Array.isArray(content) &&
+    content.some(
+      (block) =>
+        typeof block === "object" &&
+        block !== null &&
+        block.type === "text" &&
+        typeof block.text === "string" &&
+        block.text.startsWith(INTERRUPTED),
+    )
+  );
+}
 
 function hasToolUse(record: TranscriptRecord): boolean {
   const content = record.message?.content;
@@ -52,6 +76,9 @@ export function turnEndReason(record: TranscriptRecord): TurnEndReason | undefin
   }
   if (record.type === "system") {
     return record.subtype === "turn_duration" ? "turn_duration" : undefined;
+  }
+  if (record.type === "user") {
+    return isInterruption(record) ? "interrupted" : undefined;
   }
   if (record.type !== "assistant" || hasToolUse(record)) {
     return undefined;
@@ -149,11 +176,16 @@ export class EndOfTurnDetector {
       return;
     }
     const isTurnRow = record.type === "user" || record.type === "assistant";
+    const sawTurnRow = this.sawTurnRow;
     this.sawTurnRow ||= isTurnRow;
     if (!this.sawTurnRow) {
       return;
     }
     const reason = turnEndReason(record);
+    if (reason === "interrupted" && !sawTurnRow) {
+      // The last turn's interruption, written after its cancel; this turn starts with the prompt's row.
+      return;
+    }
     if (reason === "turn_duration") {
       this.finish({ reason, record });
     } else if (reason) {
@@ -162,6 +194,15 @@ export class EndOfTurnDetector {
     } else if (isTurnRow && this.candidate) {
       this.candidate = undefined;
       this.quiet.stop();
+    }
+  }
+
+  /** While `waiting`, the turn waits on the user's answer to a dialog: no stall. */
+  waitOnUser(waiting: boolean): void {
+    if (waiting) {
+      this.stall.stop();
+    } else if (this.active) {
+      this.stall.start();
     }
   }
 

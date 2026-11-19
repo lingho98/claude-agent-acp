@@ -136,6 +136,35 @@ describe("EndOfTurnDetector", () => {
     expect(ends.map((end) => end.record)).toEqual([expect.anything(), second.at(-1)]);
   });
 
+  it("ends the turn at the interruption row the CLI writes after a declined tool permission", () => {
+    // A REPL Write the user answered "No": no turn_duration and no end_turn follow.
+    const records = fixture("rejected-turn");
+    expect(records.at(-1)?.message?.content).toEqual([
+      { type: "text", text: "[Request interrupted by user for tool use]" },
+    ]);
+    records.forEach((record) => detector.observe(record));
+    vi.advanceTimersByTime(QUIESCENCE_MS - 1);
+    expect(ends).toEqual([]);
+    vi.advanceTimersByTime(1);
+    expect(ends).toEqual([{ reason: "interrupted", record: records.at(-1) }]);
+  });
+
+  it("does not end the next turn on the last turn's late interruption row", () => {
+    const interruption = fixture("rejected-turn").at(-1) as TranscriptRecord;
+    detector.observe(interruption);
+    vi.advanceTimersByTime(QUIESCENCE_MS * 2);
+    expect(ends).toEqual([]);
+  });
+
+  it("waits on the user's answer to a dialog without a stall", () => {
+    detector.waitOnUser(true);
+    vi.advanceTimersByTime(STALL_MS * 2);
+    expect(stalls).toEqual([]);
+    detector.waitOnUser(false);
+    vi.advanceTimersByTime(STALL_MS);
+    expect(stalls).toHaveLength(1);
+  });
+
   it("reports a stall when neither the transcript nor the terminal moves", () => {
     vi.advanceTimersByTime(STALL_MS - 1);
     detector.noteActivity();

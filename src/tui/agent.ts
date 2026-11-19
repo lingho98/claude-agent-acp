@@ -6,13 +6,14 @@
  *
  * It serves `initialize`, `session/new`, `session/load`, `session/close`,
  * `session/prompt` (text and resource links), `session/cancel`,
- * `session/set_mode` (`auto` only) and `session/set_config_option` (`model`,
- * until the CLI starts). The CLI starts at a session's first prompt, never
- * at `session/new`: a client may open a session only to read its options.
+ * `session/set_mode` (`auto` or `default`, until the CLI starts) and
+ * `session/set_config_option` (`model`, until the CLI starts). The CLI starts
+ * at a session's first prompt, never at `session/new`: a client may open a
+ * session only to read its options.
  *
- * ponytail: one permission mode, `auto`, and no permission requests to the
- * client; a screen the CLI waits on fails the prompt. The permission gate
- * comes with chunk 3.
+ * A dialog the CLI asks the user (the folder-trust dialog, a tool permission
+ * in the `default` mode) goes to the client as `session/request_permission`;
+ * see `dialogs.ts` for the screens and options.
  */
 
 import {
@@ -33,6 +34,7 @@ import {
   type PromptRequest,
   type PromptResponse,
   RequestError,
+  type RequestPermissionRequest,
   type SessionConfigOption,
   type SessionModeState,
   type SessionNotification,
@@ -46,24 +48,28 @@ import { readFileSync } from "node:fs";
 import type { Logger } from "../logger.js";
 import { DEFAULT_MODEL_ID } from "../session-config-ids.js";
 import { MODEL_CONFIG_ID } from "../session-model.js";
+import type { ChoiceOption, Dialog } from "./dialogs.js";
 import { TuiEngine, type TuiEngineOptions } from "./engine.js";
 import { TranscriptToAcp } from "./transcript-to-acp.js";
 import { findTranscript, LineReader } from "./transcript.js";
 import packageJson from "../../package.json" with { type: "json" };
 
-/** The one permission mode the CLI runs in: it asks nothing the adapter would have to answer. */
-const PERMISSION_MODE = "auto";
+/** The permission mode a session starts in. */
+const DEFAULT_MODE = "auto";
 
-const MODES: SessionModeState = {
-  currentModeId: PERMISSION_MODE,
-  availableModes: [
-    {
-      id: PERMISSION_MODE,
-      name: "Auto",
-      description: "Claude Code's auto mode. The terminal engine runs no other mode.",
-    },
-  ],
-};
+/** The `--permission-mode` values the CLI is spawned with. */
+const MODES: SessionModeState["availableModes"] = [
+  {
+    id: DEFAULT_MODE,
+    name: "Auto",
+    description: "Claude Code's auto mode: it decides which tool calls need your approval.",
+  },
+  {
+    id: "default",
+    name: "Default",
+    description: "Claude Code asks before it edits files or runs commands.",
+  },
+];
 
 /** The model choices: the CLI's own default and its aliases. Any model id the CLI takes is accepted too. */
 const MODEL_CHOICES = [
@@ -82,6 +88,8 @@ type TuiSession = {
   id: string;
   cwd: string;
   model: string;
+  /** The permission mode, passed as `--permission-mode` at spawn. */
+  mode: string;
   /** Created at the first prompt, and again at the prompt after the CLI stopped. */
   engine: TuiEngineLike | undefined;
   adapter: TranscriptToAcp;
@@ -94,7 +102,7 @@ export class TuiAcpAgent {
   private clientCapabilities: ClientCapabilities | undefined;
 
   constructor(
-    private readonly client: Pick<AgentContext, "notify">,
+    private readonly client: Pick<AgentContext, "notify" | "request">,
     readonly logger: Logger = console,
     private readonly createEngine: (options: TuiEngineOptions) => TuiEngineLike = (options) =>
       new TuiEngine(options),
@@ -121,7 +129,7 @@ export class TuiAcpAgent {
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     this.warnMcpServers(params.mcpServers);
     const session = this.openSession(randomUUID(), params.cwd);
-    return { sessionId: session.id, modes: MODES, configOptions: configOptions(session) };
+    return { sessionId: session.id, modes: modes(session), configOptions: configOptions(session) };
   }
 
   /** Replays the session's transcript; the CLI resumes the session at the next prompt. */
@@ -145,12 +153,14 @@ export class TuiAcpAgent {
       await this.send(session.adapter.updates(record, { replay: true }));
     }
     await this.send(session.adapter.endTurn());
-    return { modes: MODES, configOptions: configOptions(session) };
+    return { modes: modes(session), configOptions: configOptions(session) };
   }
 
+  /** Resolves once the session's CLI exited. */
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
-    this.sessions.get(params.sessionId)?.engine?.dispose();
+    const engine = this.sessions.get(params.sessionId)?.engine;
     this.sessions.delete(params.sessionId);
+    await engine?.dispose();
     return {};
   }
 
@@ -193,13 +203,22 @@ export class TuiAcpAgent {
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    this.session(params.sessionId);
-    if (params.modeId !== PERMISSION_MODE) {
+    const session = this.session(params.sessionId);
+    if (!MODES.some(({ id }) => id === params.modeId)) {
       throw RequestError.invalidParams(
         undefined,
-        `The terminal engine runs in the "${PERMISSION_MODE}" mode only, not "${params.modeId}".`,
+        `The terminal engine runs the ${MODES.map(({ id }) => `"${id}"`).join(" and ")} modes, not "${params.modeId}".`,
       );
     }
+    if (session.engine && !session.engine.stopped && params.modeId !== session.mode) {
+      // ponytail: Shift+Tab cycles the running CLI's mode, but the cycle's
+      // order and the mode it lands on are the CLI's; set at spawn only.
+      throw RequestError.invalidRequest(
+        undefined,
+        `The permission mode can't change once the session's Claude CLI runs; a mode change needs a new session.`,
+      );
+    }
+    session.mode = params.modeId;
     return {};
   }
 
@@ -225,16 +244,20 @@ export class TuiAcpAgent {
     return { configOptions: configOptions(session) };
   }
 
+  /** Resolves once every session's CLI exited. */
   async dispose(): Promise<void> {
-    for (const session of this.sessions.values()) {
-      session.engine?.dispose();
-    }
+    const engines = [...this.sessions.values()].map(({ engine }) => engine?.dispose());
     this.sessions.clear();
+    await Promise.all(engines);
   }
 
   private async runTurn(session: TuiSession, text: string, turn: Turn): Promise<PromptResponse> {
     if (turn.cancelled) {
       return { stopReason: "cancelled" };
+    }
+    // A CLI that stopped after the last turn returned (a cancel during startup, an exit while idle).
+    if (session.engine?.stopped) {
+      session.engine = undefined;
     }
     const engine = (session.engine ??= this.startEngine(session));
     let tuiTurn;
@@ -270,8 +293,54 @@ export class TuiAcpAgent {
       cwd: session.cwd,
       ...(resume ? { resume: session.id } : { sessionId: session.id }),
       ...(session.model !== DEFAULT_MODEL_ID ? { model: session.model } : {}),
-      permissionMode: PERMISSION_MODE,
+      permissionMode: session.mode,
+      askUser: (dialog, signal) => this.askUser(session, dialog, signal),
     });
+  }
+
+  /**
+   * Sends `dialog` to the client as a permission request: the screen's
+   * question as the title, the lines above its options as the content, one
+   * permission option per screen option. Resolves the option the client
+   * chose, or `undefined` when it cancelled. `signal` withdraws the request.
+   */
+  private async askUser(
+    session: TuiSession,
+    dialog: Dialog,
+    signal: AbortSignal,
+  ): Promise<ChoiceOption | undefined> {
+    const request: RequestPermissionRequest = {
+      sessionId: session.id,
+      toolCall: {
+        toolCallId: `dialog-${randomUUID()}`,
+        title: dialog.question,
+        kind: "other",
+        status: "pending",
+        content: [{ type: "content", content: { type: "text", text: dialog.excerpt } }],
+      },
+      options: dialog.options.map(({ label, kind, row }) => ({
+        optionId: String(row),
+        name: label,
+        kind,
+      })),
+    };
+    try {
+      const { outcome } = await this.client.request(
+        methods.client.session.requestPermission,
+        request,
+        { cancellationSignal: signal, stopWaitingOnCancel: true },
+      );
+      return outcome.outcome === "selected"
+        ? dialog.options.find(({ row }) => String(row) === outcome.optionId)
+        : undefined;
+    } catch (error) {
+      if (!signal.aborted) {
+        this.logger.error(
+          `[claude-agent-acp] The permission request for "${dialog.question}" failed: ${(error as Error).message}`,
+        );
+      }
+      return undefined;
+    }
   }
 
   private openSession(id: string, cwd: string): TuiSession {
@@ -285,6 +354,7 @@ export class TuiAcpAgent {
       id,
       cwd,
       model: DEFAULT_MODEL_ID,
+      mode: DEFAULT_MODE,
       engine: undefined,
       adapter,
       turn: undefined,
@@ -318,6 +388,10 @@ export class TuiAcpAgent {
       );
     }
   }
+}
+
+function modes(session: TuiSession): SessionModeState {
+  return { currentModeId: session.mode, availableModes: MODES };
 }
 
 function configOptions(session: TuiSession): SessionConfigOption[] {

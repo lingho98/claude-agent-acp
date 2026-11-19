@@ -1,12 +1,18 @@
-import { RequestError, type SessionNotification } from "@agentclientprotocol/sdk/unstable";
+import {
+  RequestError,
+  type RequestPermissionRequest,
+  type RequestPermissionResponse,
+  type SessionNotification,
+} from "@agentclientprotocol/sdk/unstable";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TuiAcpAgent, type TuiEngineLike } from "../../tui/agent.js";
+import { detectDialog, type Dialog } from "../../tui/dialogs.js";
 import type { TuiEngineOptions, TurnResult } from "../../tui/engine.js";
 import type { TranscriptRecord } from "../../tui/transcript.js";
-import { fixture } from "./fixture.js";
+import { fixture, fixtureText } from "./fixture.js";
 
 /** A TuiEngine double: each prompt's turn ends when the test calls `finish`. */
 class FakeEngine implements TuiEngineLike {
@@ -18,6 +24,9 @@ class FakeEngine implements TuiEngineLike {
   constructor(readonly options: TuiEngineOptions) {}
 
   prompt(text: string) {
+    if (this.stopped) {
+      throw new Error("The session's Claude CLI was stopped. Start a new session.");
+    }
     this.prompts.push(text);
     let finish!: (outcome: TurnResult | Error) => void;
     const settled = new Promise<TurnResult | Error>((resolve) => (finish = resolve));
@@ -51,9 +60,13 @@ class FakeEngine implements TuiEngineLike {
     this.end({ stopReason: "cancelled" });
   }
 
+  /** Resolves when the test calls `exited`, as the real CLI's exit. */
   dispose() {
     this.stopped = true;
+    return new Promise<void>((resolve) => (this.exited = resolve));
   }
+
+  exited: (() => void) | undefined;
 }
 
 describe("TuiAcpAgent", () => {
@@ -61,16 +74,30 @@ describe("TuiAcpAgent", () => {
   let sent: SessionNotification[];
   let engines: FakeEngine[];
   let agent: TuiAcpAgent;
+  /** Answers the agent's `session/request_permission`; records each request and its signal. */
+  let permissions: Array<{ params: RequestPermissionRequest; signal?: AbortSignal }>;
+  let answer: (params: RequestPermissionRequest) => Promise<RequestPermissionResponse>;
 
   beforeEach(async () => {
     configDir = mkdtempSync(path.join(tmpdir(), "tui-agent-"));
     vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
     sent = [];
     engines = [];
+    permissions = [];
+    answer = async () => ({ outcome: { outcome: "cancelled" } });
     agent = new TuiAcpAgent(
       {
         notify: async (_method: string, params: unknown) =>
           void sent.push(params as SessionNotification),
+        request: async (
+          method: string,
+          params: RequestPermissionRequest,
+          options?: { cancellationSignal?: AbortSignal },
+        ) => {
+          expect(method).toBe("session/request_permission");
+          permissions.push({ params, signal: options?.cancellationSignal });
+          return answer(params);
+        },
       } as never,
       console,
       (options) => {
@@ -90,19 +117,98 @@ describe("TuiAcpAgent", () => {
   const prompt = (sessionId: string, text = "hi") =>
     agent.prompt({ sessionId, prompt: [{ type: "text", text }] });
 
-  it("starts no CLI for a new session and offers the auto mode alone", async () => {
+  it("starts no CLI for a new session and offers the auto and default modes", async () => {
     const session = await agent.newSession({ cwd: "/work", mcpServers: [] });
     expect(engines).toEqual([]);
     expect(session.modes).toEqual({
       currentModeId: "auto",
-      availableModes: [expect.objectContaining({ id: "auto" })],
+      availableModes: [
+        expect.objectContaining({ id: "auto" }),
+        expect.objectContaining({ id: "default" }),
+      ],
     });
     await expect(
-      agent.setSessionMode({ sessionId: session.sessionId, modeId: "default" }),
-    ).rejects.toThrow('runs in the "auto" mode only');
-    await expect(
-      agent.setSessionMode({ sessionId: session.sessionId, modeId: "auto" }),
-    ).resolves.toEqual({});
+      agent.setSessionMode({ sessionId: session.sessionId, modeId: "acceptEdits" }),
+    ).rejects.toThrow('runs the "auto" and "default" modes, not "acceptEdits"');
+  });
+
+  it("spawns the CLI in the mode set before the first prompt and refuses a change after", async () => {
+    const { sessionId } = await agent.newSession({ cwd: "/work", mcpServers: [] });
+    await expect(agent.setSessionMode({ sessionId, modeId: "default" })).resolves.toEqual({});
+    const turn = prompt(sessionId);
+    await vi.waitFor(() => expect(engines).toHaveLength(1));
+    expect(engines[0].options.permissionMode).toBe("default");
+
+    await expect(agent.setSessionMode({ sessionId, modeId: "auto" })).rejects.toThrow(
+      "a mode change needs a new session",
+    );
+    await expect(agent.setSessionMode({ sessionId, modeId: "default" })).resolves.toEqual({});
+    engines[0].end({ stopReason: "end_turn" });
+    await turn;
+  });
+
+  it("asks the client about a dialog and resolves the option it chose", async () => {
+    const { sessionId } = await agent.newSession({ cwd: "/work", mcpServers: [] });
+    const turn = prompt(sessionId);
+    await vi.waitFor(() => expect(engines).toHaveLength(1));
+    const askUser = engines[0].options.askUser;
+    const dialog = detectDialog(fixtureText("tool-bash-screen.txt")) as Dialog;
+
+    answer = async () => ({ outcome: { outcome: "selected", optionId: "3" } });
+    const signal = new AbortController().signal;
+    expect(await askUser?.(dialog, signal)).toEqual({ label: "No", kind: "reject_once", row: 3 });
+    const [{ params, signal: sentSignal }] = permissions;
+    expect(sentSignal).toBe(signal);
+    expect(params).toEqual({
+      sessionId,
+      toolCall: {
+        toolCallId: expect.stringMatching(/^dialog-/),
+        title: "Do you want to proceed?",
+        kind: "other",
+        status: "pending",
+        content: [{ type: "content", content: { type: "text", text: dialog.excerpt } }],
+      },
+      options: [
+        { optionId: "0", name: "Yes", kind: "allow_once" },
+        {
+          optionId: "1",
+          name: expect.stringMatching(/^Yes, and don't ask again/),
+          kind: "allow_always",
+        },
+        { optionId: "3", name: "No", kind: "reject_once" },
+      ],
+    });
+
+    answer = async () => ({ outcome: { outcome: "cancelled" } });
+    expect(await askUser?.(dialog, signal)).toBeUndefined();
+    answer = async () => Promise.reject(new Error("connection closed"));
+    expect(await askUser?.(dialog, signal)).toBeUndefined();
+    engines[0].end({ stopReason: "end_turn" });
+    await turn;
+  });
+
+  it("resolves session/close and dispose once the CLI exited", async () => {
+    const one = await agent.newSession({ cwd: "/work", mcpServers: [] });
+    const two = await agent.newSession({ cwd: "/work", mcpServers: [] });
+    for (const { sessionId } of [one, two]) {
+      const turn = prompt(sessionId);
+      await vi.waitFor(() => expect(engines.at(-1)?.prompts).toEqual(["hi"]));
+      engines.at(-1)?.end({ stopReason: "end_turn" });
+      await turn;
+    }
+    let closed = false;
+    const close = agent.closeSession({ sessionId: one.sessionId }).then(() => (closed = true));
+    await vi.waitFor(() => expect(engines[0].exited).toBeDefined());
+    expect(closed).toBe(false);
+    engines[0].exited?.();
+    await close;
+
+    let disposed = false;
+    const dispose = agent.dispose().then(() => (disposed = true));
+    await vi.waitFor(() => expect(engines[1].exited).toBeDefined());
+    expect(disposed).toBe(false);
+    engines[1].exited?.();
+    await dispose;
   });
 
   it("starts the CLI with the model set before the first prompt and refuses a change after", async () => {
@@ -121,6 +227,7 @@ describe("TuiAcpAgent", () => {
       sessionId,
       model: "claude-haiku-5-5",
       permissionMode: "auto",
+      askUser: expect.any(Function),
     });
     engines[0].end({ stopReason: "turn_duration" });
     expect(await turn).toEqual({ stopReason: "end_turn" });
@@ -177,6 +284,21 @@ describe("TuiAcpAgent", () => {
     await vi.waitFor(() => expect(engines).toHaveLength(2));
     engines[1].end({ stopReason: "end_turn" });
     await second;
+  });
+
+  it("starts another CLI when the last one stopped after its cancelled turn returned", async () => {
+    const { sessionId } = await agent.newSession({ cwd: "/work", mcpServers: [] });
+    const first = prompt(sessionId);
+    await vi.waitFor(() => expect(engines).toHaveLength(1));
+    await agent.cancel({ sessionId });
+    expect(await first).toEqual({ stopReason: "cancelled" });
+    // As a cancel during the trust question: the CLI exits after the turn returned.
+    engines[0].stopped = true;
+
+    const second = prompt(sessionId);
+    await vi.waitFor(() => expect(engines).toHaveLength(2));
+    engines[1].end({ stopReason: "end_turn" });
+    expect(await second).toEqual({ stopReason: "end_turn" });
   });
 
   it("replays a loaded session's transcript and resumes it at the next prompt", async () => {

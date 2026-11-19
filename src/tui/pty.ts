@@ -27,6 +27,8 @@ export const SCREEN_LINES = 200;
 const SUBMIT_DELAY_MS = 200;
 /** How long `interrupt()` waits after `\x03` before escalating with Esc. */
 const INTERRUPT_ESCALATE_MS = 1000;
+/** How long `dispose()` waits for the CLI to exit on SIGHUP before it sends SIGKILL. */
+export const EXIT_GRACE_MS = 3000;
 
 /**
  * Session variables an agent host (Claude Code, the Agent SDK, Paseo) sets
@@ -136,8 +138,10 @@ function loadNodePty(): Promise<typeof import("node-pty")> {
     } catch (error) {
       nodePty = undefined;
       // ponytail: no node-gyp handling for Linux in v0.1; node-pty 1.1.0 ships prebuilds for macOS and Windows only.
+      // ponytail: `build:binary` bundles no node-pty; ship it in the binary if the terminal engine needs one.
       throw new Error(
-        `Could not load node-pty (${(error as Error).message}). On Linux it has no prebuilt binary: ` +
+        `Could not load node-pty (${(error as Error).message}). The terminal engine needs the npm install ` +
+          "(`node dist/index.js`), not the compiled binary. On Linux node-pty has no prebuilt binary: " +
           "build it with `npm rebuild node-pty`, or allow its install script.",
         { cause: error },
       );
@@ -185,6 +189,7 @@ export class ClaudePty {
   private exitListeners: Array<(exitCode: number) => void> = [];
   private escalation: ReturnType<typeof setTimeout> | undefined;
   private log = "";
+  private disposing: Promise<void> | undefined;
   exited = false;
 
   private constructor(private readonly pty: IPty) {
@@ -283,11 +288,26 @@ export class ClaudePty {
     }, INTERRUPT_ESCALATE_MS);
   }
 
-  dispose(): void {
+  /**
+   * Asks the CLI to exit with SIGHUP, as a closed terminal does, and sends
+   * SIGKILL if it still runs after {@link EXIT_GRACE_MS}. Resolves once the
+   * process exited.
+   */
+  dispose(): Promise<void> {
     clearTimeout(this.escalation);
-    if (!this.exited) {
+    this.disposing ??= new Promise((resolve) => {
+      if (this.exited) {
+        resolve();
+        return;
+      }
+      const kill = setTimeout(() => this.pty.kill("SIGKILL"), EXIT_GRACE_MS);
+      this.onExit(() => {
+        clearTimeout(kill);
+        resolve();
+      });
       this.pty.kill();
-    }
+    });
+    return this.disposing;
   }
 
   private append(text: string): void {

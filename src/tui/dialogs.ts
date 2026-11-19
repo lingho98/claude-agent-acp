@@ -1,40 +1,73 @@
 /**
- * The blocking screens the interactive CLI shows before it takes a prompt, read
- * from `ClaudePty`'s ANSI-stripped output.
+ * The blocking choice screens the interactive CLI shows, read from
+ * `ClaudePty`'s ANSI-stripped output. CLI 2.1.328 draws two shapes, both
+ * above a footer line that starts with "Enter to confirm" or "Esc to cancel":
  *
- * CLI 2.1.328 draws them as a select list with the cursor on "No" and no
- * option numbers:
+ *   the trust and Code Mode dialogs,     a tool permission,
+ *   no numbers, cursor on "No":          numbered, cursor on "1.":
  *
- *   ❯ No, exit
- *     Yes, I trust this folder
+ *     ❯ No, exit                           Do you want to proceed?
+ *     Yes, I trust this folder             ❯ 1. Yes
+ *                                            2. Yes, and don't ask again for mkdir commands in
+ *     Enter to confirm · Esc to cancel          /work
+ *                                            3. Yes, and switch to auto mode
+ *                                            4. No
  *
- * so the answer is the arrow keys from the cursor to "Yes", then Enter. A
- * screen that blocks with no dialog known here is caught by `TuiEngine`'s
- * unknown-dialog watchdog.
+ *                                          Esc to cancel · Tab to amend
+ *
+ * An option is picked with the arrow keys from the cursor's row, then Enter.
+ * A screen whose options are not all "Yes…" or "No…" is not read as a
+ * dialog. `TuiEngine` fails startup on it after 60 s, and a turn once screen
+ * and transcript stay unchanged for 30 s.
  */
 
-export type DialogKind = "trust" | "code-mode";
+import { stripAnsi } from "./pty.js";
+
+export type DialogKind = "trust" | "code-mode" | "permission";
+
+/** The ACP permission option kinds a screen option maps to. */
+export type ChoiceKind = "allow_once" | "allow_always" | "reject_once";
+
+export type ChoiceOption = {
+  label: string;
+  kind: ChoiceKind;
+  /** The option's row in the list on screen, counting rows {@link Dialog.options} leaves out. */
+  row: number;
+};
 
 export type Dialog = {
   kind: DialogKind;
+  /** The screen's question, e.g. "Do you want to proceed?". */
+  question: string;
+  /** The screen lines above the options, e.g. the command a tool permission names. */
+  excerpt: string;
+  options: ChoiceOption[];
   /**
-   * The keys that pick "Yes", or `undefined` when the cursor's place relative
-   * to "Yes" can't be read. Never guessed: Enter on the default picks "No".
+   * The row of the `❯` cursor, or `undefined` when it can't be read. Never
+   * guessed: Enter on the wrong row picks another answer.
    */
-  keys: string | undefined;
-};
-
-const YES_LABELS: Record<DialogKind, string> = {
-  trust: "Yes, I trust this folder",
-  "code-mode": "Yes, turn on Code Mode",
+  cursor: number | undefined;
 };
 
 const CURSOR = "❯";
 const DOWN = "\x1b[B";
-/** A line break in the screen log: Ink often ends a line with `\r` and moves the cursor down. */
-export const LINE_BREAK = /\r\n|\r|\n/;
-/** Options a select list can have above "Yes"; more means the `❯` belongs to something else. */
-const MAX_OPTIONS_ABOVE = 3;
+const UP = "\x1b[A";
+/**
+ * A line break in the screen log: Ink often ends a line with `\r` and moves
+ * the cursor down, and the PTY writes a `\n` as `\r\n`, so one break can be `\r\r\n`.
+ */
+export const LINE_BREAK = /\r*\n|\r/;
+const FOOTER = /^(Enter to confirm|Esc to cancel)\b/;
+/** A numbered option's first line; a line that doesn't match continues the option above. */
+const NUMBERED = /^(❯ )?(\d+)\. (.*)$/;
+/** An unnumbered option's line. */
+const PLAIN_OPTION = /^(❯ ?)?(Yes|No)\b/;
+/** A rule across the screen: the top of a tool permission dialog. */
+const RULE = /^─{10,}$/;
+/** Lines {@link Dialog.excerpt} takes at most. */
+const EXCERPT_LINES = 12;
+/** Lines of one option list at most; more means the footer belongs to something else. */
+const MAX_OPTION_LINES = 12;
 
 /**
  * The dialog that `screen` shows last, if any. Pass only output received
@@ -42,17 +75,53 @@ const MAX_OPTIONS_ABOVE = 3;
  * text stays in it.
  */
 export function detectDialog(screen: string): Dialog | undefined {
-  let found: { kind: DialogKind; at: number } | undefined;
-  for (const [kind, label] of Object.entries(YES_LABELS) as Array<[DialogKind, string]>) {
-    const at = screen.lastIndexOf(label);
-    if (at >= 0 && (!found || at > found.at)) {
-      found = { kind, at };
-    }
+  // Stripped again: an escape split across two output chunks survives `ClaudePty`'s per-chunk strip.
+  const lines = stripAnsi(screen)
+    .split(LINE_BREAK)
+    .map((line) => line.replace(/\s+/g, " ").trim());
+  const footer = lines.findLastIndex((line) => FOOTER.test(line));
+  let end = footer - 1;
+  while (end >= 0 && !lines[end]) {
+    end--;
   }
-  if (!found) {
+  if (footer < 0 || end < 0) {
     return undefined;
   }
-  return { kind: found.kind, keys: keysToYes(screen.slice(0, found.at)) };
+  const list = NUMBERED.test(lines[end]) ? numberedList(lines, end) : plainList(lines, end);
+  if (!list) {
+    return undefined;
+  }
+  const kinds = list.rows.map(({ label }) => optionKind(label));
+  if (
+    kinds.includes(undefined) ||
+    !kinds.includes("reject_once") ||
+    !kinds.some((kind) => kind?.startsWith("allow"))
+  ) {
+    return undefined;
+  }
+  const cursors = list.rows.flatMap(({ cursor }, row) => (cursor ? [row] : []));
+  const excerpt = excerptAbove(lines, list.start);
+  const options = list.rows.flatMap(({ label }, row) => {
+    const kind = kinds[row];
+    // ponytail: mode-switch options hidden until the agent advertises those modes.
+    return kind === "mode" || kind === undefined ? [] : [{ label, kind, row }];
+  });
+  return {
+    kind: dialogKind(options),
+    question: question(excerpt),
+    excerpt: excerpt.join("\n"),
+    options,
+    cursor: cursors.length === 1 ? cursors[0] : undefined,
+  };
+}
+
+/** Arrow keys from the cursor's row to `option`'s, then Enter; `undefined` when the cursor can't be read. */
+export function keysFor(dialog: Dialog, option: ChoiceOption): string | undefined {
+  if (dialog.cursor === undefined) {
+    return undefined;
+  }
+  const moves = option.row - dialog.cursor;
+  return (moves >= 0 ? DOWN.repeat(moves) : UP.repeat(-moves)) + "\r";
 }
 
 /**
@@ -68,19 +137,92 @@ export function showsInputBox(screen: string): boolean {
   return /─{20,}[ \t]*[\r\n]+[ \t]*❯[^\r\n]*[\r\n]+[ \t]*─{20,}/.test(screen);
 }
 
-/** Arrow keys from the last `❯` in `before` (the text up to "Yes") down to "Yes", then Enter. */
-function keysToYes(before: string): string | undefined {
-  const cursor = before.lastIndexOf(CURSOR);
-  if (cursor < 0) {
+type Row = { label: string; cursor: boolean };
+type OptionList = { start: number; rows: Row[] };
+
+/** The numbered options ending at line `end`, from "1." on; a wrapped option spans lines. */
+function numberedList(lines: string[], end: number): OptionList | undefined {
+  let start = end;
+  while (
+    start >= 0 &&
+    end - start < MAX_OPTION_LINES &&
+    lines[start].match(NUMBERED)?.[2] !== "1"
+  ) {
+    if (!lines[start]) {
+      return undefined;
+    }
+    start--;
+  }
+  if (start < 0 || end - start >= MAX_OPTION_LINES) {
     return undefined;
   }
-  // Each option is one line; the lines from the cursor up to "Yes" are the options above it.
-  const above = before
-    .slice(cursor + CURSOR.length)
-    .split(LINE_BREAK)
-    .slice(0, -1).length;
-  if (above > MAX_OPTIONS_ABOVE) {
+  const rows: Row[] = [];
+  for (const line of lines.slice(start, end + 1)) {
+    const match = line.match(NUMBERED);
+    if (match && Number(match[2]) === rows.length + 1) {
+      rows.push({ label: match[3], cursor: match[1] !== undefined });
+    } else {
+      rows[rows.length - 1].label += ` ${line}`;
+    }
+  }
+  return { start, rows };
+}
+
+/** The unnumbered options ending at line `end`: one per line, each a "Yes…" or "No…". */
+function plainList(lines: string[], end: number): OptionList | undefined {
+  let start = end + 1;
+  while (start > 0 && PLAIN_OPTION.test(lines[start - 1]) && end - start < MAX_OPTION_LINES) {
+    start--;
+  }
+  const rows = lines.slice(start, end + 1).map((line) => ({
+    label: line.startsWith(CURSOR) ? line.slice(CURSOR.length).trim() : line,
+    cursor: line.startsWith(CURSOR),
+  }));
+  return rows.length > 1 ? { start, rows } : undefined;
+}
+
+/** "No…" rejects; "Yes…" allows, always when it says "don't ask again"; "mode" switches the permission mode. */
+function optionKind(label: string): ChoiceKind | "mode" | undefined {
+  if (/^No\b/.test(label)) {
+    return "reject_once";
+  }
+  if (!/^Yes\b/.test(label)) {
     return undefined;
   }
-  return DOWN.repeat(above) + "\r";
+  if (/\bswitch to\b/i.test(label)) {
+    return "mode";
+  }
+  return /don't ask again|\balways\b/i.test(label) ? "allow_always" : "allow_once";
+}
+
+function dialogKind(options: ChoiceOption[]): DialogKind {
+  const labels = options.map(({ label }) => label);
+  if (labels.includes("Yes, I trust this folder")) {
+    return "trust";
+  }
+  return labels.includes("Yes, turn on Code Mode") ? "code-mode" : "permission";
+}
+
+/**
+ * The lines that are not blank above line `start`, up to a rule or
+ * {@link EXCERPT_LINES}. Dashed box edges are dropped, and so are tips: they
+ * point at the mode-switch options the dialog leaves out.
+ */
+function excerptAbove(lines: string[], start: number): string[] {
+  const excerpt: string[] = [];
+  for (let i = start - 1; i >= 0 && excerpt.length < EXCERPT_LINES && !RULE.test(lines[i]); i--) {
+    if (lines[i] && !/^(╌+$|Tip:)/.test(lines[i])) {
+      excerpt.unshift(lines[i]);
+    }
+  }
+  return excerpt;
+}
+
+/** The last excerpt line that asks something, up to its "?"; else the last line. */
+function question(excerpt: string[]): string {
+  const asking = excerpt.findLast((line) => line.includes("?"));
+  if (!asking) {
+    return excerpt.at(-1) ?? "Claude Code asks you to choose";
+  }
+  return asking.slice(0, asking.lastIndexOf("?")).trimEnd() + "?";
 }

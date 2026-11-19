@@ -3,13 +3,23 @@
  * answers its Code Mode dialog, sends prompts, and streams each turn's
  * transcript records until the turn ends. Knows nothing of ACP.
  *
- * The trust dialog is never answered: the prompt fails and names the folder.
- * ponytail: no trust handling until the permission gate (chunk 3) can ask the user.
+ * Every other dialog `detectDialog` reads (the trust dialog, a tool
+ * permission) goes to `askUser`, and the engine picks the option the user
+ * chose. The trust dialog is never answered without the user: declining it,
+ * or no `askUser`, fails the prompt and names the folder.
  */
 
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { detectDialog, LINE_BREAK, showsInputBox, type DialogKind } from "./dialogs.js";
+import {
+  type ChoiceOption,
+  detectDialog,
+  type Dialog,
+  type DialogKind,
+  keysFor,
+  LINE_BREAK,
+  showsInputBox,
+} from "./dialogs.js";
 import { EndOfTurnDetector, QuietTimer, type TurnEndReason } from "./end-of-turn.js";
 import { ClaudePty, type ClaudePtyOptions } from "./pty.js";
 import { TranscriptTail, type TranscriptRecord } from "./transcript.js";
@@ -34,10 +44,16 @@ export type TuiEngineOptions = Omit<ClaudePtyOptions, "sessionId"> & {
   unknownDialogMs?: number;
   /** The `projects` directory to find the transcript in. Default: `projectsRoot()`. */
   projectsRoot?: string;
+  /**
+   * Asks the user to pick one of `dialog`'s options. Resolves `undefined`
+   * when the user picked none (the client cancelled the request). `signal`
+   * aborts when the turn is cancelled; the engine then answers "No" itself.
+   */
+  askUser?: (dialog: Dialog, signal: AbortSignal) => Promise<ChoiceOption | undefined>;
 };
 
 export type TuiEngineEvents = {
-  /** A startup dialog the engine answered "Yes". */
+  /** A dialog the engine answered: "Yes" to Code Mode, or the user's choice. */
   dialog: [kind: DialogKind];
   /** The CLI waits on a screen the engine can't answer; `screen` is its recent output. */
   "unknown-dialog": [screen: string];
@@ -76,6 +92,11 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
   private readonly tail: TranscriptTail;
   private readonly detector: EndOfTurnDetector;
   private readonly unknownDialog: QuietTimer;
+  /** The dialog the user is asked about; one at a time. */
+  private asking: { dialog: Dialog; controller: AbortController } | undefined;
+  /** During a turn, after the prompt is sent: output before this mark holds no unanswered dialog. */
+  private dialogMark: number | undefined;
+  private spawning: Promise<ClaudePty> | undefined;
   private disposed = false;
 
   constructor(private readonly options: TuiEngineOptions) {
@@ -163,16 +184,25 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
     this.interrupt({ stopReason: "cancelled" });
   }
 
-  dispose(): void {
-    if (this.disposed) {
-      return;
+  /** Cancels the turn and stops the CLI; resolves once its process exited (see `ClaudePty.dispose`). */
+  dispose(): Promise<void> {
+    if (!this.disposed) {
+      this.disposed = true;
+      this.cancel();
+      this.detector.stop();
+      this.unknownDialog.stop();
+      this.tail.stop();
     }
-    this.disposed = true;
-    this.cancel();
-    this.detector.stop();
-    this.unknownDialog.stop();
-    this.tail.stop();
-    this.pty?.dispose();
+    if (this.pty) {
+      return this.pty.dispose();
+    }
+    // Still spawning: `spawn` disposes the new CLI when it sees `disposed`.
+    return (
+      this.spawning?.then(
+        (pty) => pty.dispose(),
+        () => {},
+      ) ?? Promise.resolve()
+    );
   }
 
   private run(turn: Turn, text: string): void {
@@ -186,6 +216,7 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
         if (this.pty && this.turn === turn && !turn.cancelled) {
           this.detector.begin();
           this.unknownDialog.start();
+          this.dialogMark = this.pty.mark();
           this.pty.sendPrompt(text);
         }
       },
@@ -202,7 +233,16 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
     turn.cancelled = true;
     settle(turn, outcome);
     this.unknownDialog.stop();
-    this.pty?.interrupt(() => this.turn === turn);
+    const asking = this.asking;
+    if (asking) {
+      // The CLI waits on the dialog: a Ctrl+C, then Esc, would land on the input box after it.
+      this.asking = undefined;
+      asking.controller.abort();
+      const no = asking.dialog.options.find(({ kind }) => kind === "reject_once");
+      this.pty?.write((no && keysFor(asking.dialog, no)) ?? "\x1b");
+    } else {
+      this.pty?.interrupt(() => this.turn === turn);
+    }
     setTimeout(() => {
       if (this.turn === turn) {
         this.detector.stop();
@@ -214,20 +254,27 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
   private clearTurn(turn: Turn): void {
     if (this.turn === turn) {
       this.turn = undefined;
+      this.dialogMark = undefined;
+      this.asking?.controller.abort();
+      this.asking = undefined;
       turn.clear();
     }
   }
 
   private async spawn(): Promise<void> {
-    const pty = await ClaudePty.spawn({ ...this.options, sessionId: this.sessionId });
+    const pty = await (this.spawning = ClaudePty.spawn({
+      ...this.options,
+      sessionId: this.sessionId,
+    }));
     this.pty = pty;
     if (this.disposed) {
-      pty.dispose();
+      void pty.dispose();
       throw new Error("The session was disposed while its Claude CLI started.");
     }
     pty.onData(() => {
       this.detector.noteActivity();
       this.unknownDialog.poke();
+      this.relayDialog(pty);
     });
     pty.onExit((exitCode) => {
       this.disposed = true;
@@ -243,15 +290,20 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
 
   /**
    * Resolves once output stays quiet with the input box and no dialog on
-   * screen, answering the Code Mode dialog. Quiet with neither waits for more
-   * output, up to {@link START_TIMEOUT_MS}.
+   * screen. Answers the Code Mode dialog, and asks the user about any other
+   * dialog (the trust dialog). Quiet with neither waits for more output, up
+   * to {@link START_TIMEOUT_MS}; the wait for the user's answer doesn't count.
    */
   private answerStartupDialogs(pty: ClaudePty): Promise<void> {
+    const askUser = this.options.askUser;
     return new Promise((resolve, reject) => {
+      let settled = false;
       let mark = 0;
       let answers = 0;
       let answered: DialogKind | undefined;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
       const finish = (error?: Error) => {
+        settled = true;
         quiet.stop();
         clearTimeout(timeout);
         if (error) {
@@ -260,8 +312,28 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
           resolve();
         }
       };
+      const answer = (dialog: Dialog, option: ChoiceOption) => {
+        answers++;
+        answered = dialog.kind;
+        mark = pty.mark();
+        // The cursor was read; no keys only if it wasn't, and the quiet check above then fails startup.
+        pty.write(keysFor(dialog, option) ?? "");
+        this.emit("dialog", dialog.kind);
+        quiet.start();
+      };
+      const armTimeout = () => {
+        timeout = setTimeout(() => {
+          this.emit("unknown-dialog", pty.screen());
+          finish(
+            withScreen(
+              `The Claude CLI did not get ready in ${START_TIMEOUT_MS / 1000} s.`,
+              pty.screen(),
+            ),
+          );
+        }, START_TIMEOUT_MS);
+      };
       const quiet = new QuietTimer(READY_QUIET_MS, () => {
-        // No output after an answer: the keys did not take, and the prompt's Enter would pick "No".
+        // No output after an answer: the keys did not take, and the prompt's Enter would pick another option.
         if (answered && pty.mark() === mark) {
           this.emit("unknown-dialog", pty.screen());
           finish(
@@ -271,18 +343,24 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
         }
         const screen = pty.screenSince(mark);
         const dialog = detectDialog(screen);
+        const yes = dialog?.options.find(({ kind }) => kind !== "reject_once");
         if (!dialog && showsInputBox(screen)) {
           finish();
         } else if (!dialog) {
           // Not drawn yet: the next output restarts this wait, START_TIMEOUT_MS ends it.
-        } else if (dialog.kind === "trust") {
+        } else if (dialog.kind === "trust" && !askUser) {
           finish(
             new Error(
               `Claude Code does not trust the folder ${this.options.cwd}. ` +
                 `Run \`claude\` once in ${this.options.cwd}, accept the trust dialog, then try again.`,
             ),
           );
-        } else if (dialog.keys === undefined || answers >= MAX_DIALOG_ANSWERS) {
+        } else if (
+          dialog.cursor === undefined ||
+          !yes ||
+          answers >= MAX_DIALOG_ANSWERS ||
+          (dialog.kind !== "code-mode" && !askUser)
+        ) {
           this.emit("unknown-dialog", pty.screen());
           finish(
             withScreen(
@@ -290,29 +368,115 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
               pty.screen(),
             ),
           );
+        } else if (dialog.kind !== "code-mode" && askUser) {
+          clearTimeout(timeout);
+          void this.ask(dialog, askUser).then(({ option, cancelled }) => {
+            if (!cancelled && !option) {
+              // The client cancelled the request: a cancel of the prompt, which answers "No" while `asking` is set.
+              this.cancel();
+            }
+            this.asking = undefined;
+            if (settled) {
+              return;
+            }
+            if (cancelled || !option) {
+              finish(new Error("The prompt was cancelled while Claude Code asked about a dialog."));
+            } else if (option.kind === "reject_once") {
+              // Settled before the CLI's exit: its "exited with code" error must not win.
+              finish(
+                dialog.kind === "trust"
+                  ? new Error(
+                      `You declined to trust the folder ${this.options.cwd}, so Claude Code can't work in it. ` +
+                        "Send a prompt again to be asked again.",
+                    )
+                  : new Error(`You declined "${dialog.question}" as the Claude CLI started.`),
+              );
+            } else {
+              armTimeout();
+              answer(dialog, option);
+            }
+          });
         } else {
-          answers++;
-          answered = dialog.kind;
-          mark = pty.mark();
-          pty.write(dialog.keys);
-          this.emit("dialog", dialog.kind);
+          // The Code Mode dialog.
+          answer(dialog, yes);
+        }
+      });
+      armTimeout();
+      pty.onData(() => {
+        if (settled || this.asking) {
+          return;
+        }
+        if (quiet.running) {
+          quiet.poke();
+        } else {
           quiet.start();
         }
       });
-      const timeout = setTimeout(() => {
-        this.emit("unknown-dialog", pty.screen());
-        finish(
-          withScreen(
-            `The Claude CLI did not get ready in ${START_TIMEOUT_MS / 1000} s.`,
-            pty.screen(),
-          ),
-        );
-      }, START_TIMEOUT_MS);
-      pty.onData(() => (quiet.running ? quiet.poke() : quiet.start()));
       pty.onExit((exitCode) =>
         finish(new Error(`The Claude CLI exited with code ${exitCode} at startup.`)),
       );
     });
+  }
+
+  /**
+   * Asks the user about a dialog the CLI shows mid-turn, and answers it. The
+   * unknown-dialog and stall watchdogs wait while the user decides. No choice
+   * cancels the turn, answering "No" (see {@link interrupt}).
+   */
+  private relayDialog(pty: ClaudePty): void {
+    const turn = this.turn;
+    if (!turn || turn.cancelled || this.dialogMark === undefined || this.asking) {
+      return;
+    }
+    const dialog = detectDialog(pty.screenSince(this.dialogMark));
+    if (!dialog) {
+      return;
+    }
+    this.dialogMark = pty.mark();
+    const askUser = this.options.askUser;
+    if (dialog.cursor === undefined || !askUser) {
+      this.emit("unknown-dialog", pty.screen());
+      this.interrupt(
+        withScreen(
+          `The Claude CLI shows a "${dialog.kind}" dialog the adapter can't answer.`,
+          pty.screen(),
+        ),
+      );
+      return;
+    }
+    this.unknownDialog.stop();
+    this.detector.waitOnUser(true);
+    void this.ask(dialog, askUser).then(({ option, cancelled }) => {
+      if (cancelled || this.turn !== turn) {
+        return;
+      }
+      if (!option) {
+        // While `asking` is set, the cancel answers the dialog "No".
+        this.cancel();
+        return;
+      }
+      this.asking = undefined;
+      this.dialogMark = pty.mark();
+      pty.write(keysFor(dialog, option) ?? ""); // The cursor was read above.
+      this.emit("dialog", dialog.kind);
+      this.detector.waitOnUser(false);
+      this.unknownDialog.start();
+    });
+  }
+
+  /**
+   * Asks `askUser` about `dialog`, kept in {@link asking} until the caller
+   * clears it. `cancelled`: {@link interrupt} or the turn's end answered or
+   * dropped the dialog meanwhile. A failed request is no choice.
+   */
+  private async ask(
+    dialog: Dialog,
+    askUser: NonNullable<TuiEngineOptions["askUser"]>,
+  ): Promise<{ option?: ChoiceOption; cancelled: boolean }> {
+    const asking = { dialog, controller: new AbortController() };
+    this.asking = asking;
+    const option = await askUser(dialog, asking.controller.signal).catch(() => undefined);
+    return this.asking === asking ? { option, cancelled: false } : { cancelled: true };
   }
 
   private onRecord(record: TranscriptRecord): void {

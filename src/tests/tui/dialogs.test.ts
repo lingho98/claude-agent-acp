@@ -1,44 +1,143 @@
 import { describe, expect, it } from "vitest";
-import { detectDialog, showsInputBox } from "../../tui/dialogs.js";
+import { detectDialog, keysFor, showsInputBox, type Dialog } from "../../tui/dialogs.js";
 import { fixtureText } from "./fixture.js";
 
 const DOWN = "\x1b[B";
+const UP = "\x1b[A";
 
-// CLI 2.1.328's trust dialog as ClaudePty.screen() captured it (path redacted).
+// CLI 2.1.328's screens as ClaudePty.screen() captured them (paths redacted).
 const TRUST_SCREEN = fixtureText("trust-screen.txt");
+// The `default` mode's permission dialogs for a Write and a Bash call, with the
+// spinner rows the CLI keeps drawing under them. The Bash one holds an escape
+// split across two output chunks and an option wrapped onto a second line.
+const WRITE_SCREEN = fixtureText("tool-write-screen.txt");
+const BASH_SCREEN = fixtureText("tool-bash-screen.txt");
+// Built from the text quoted in the task; no capture of this dialog exists yet.
+const CODE_MODE_SCREEN =
+  "Code Mode is experimental.\n  ❯ No, start without it \n Yes, turn on Code Mode\n\n  Enter to confirm";
+
+function dialogOf(screen: string): Dialog {
+  const dialog = detectDialog(screen);
+  if (!dialog) {
+    throw new Error("no dialog on the screen");
+  }
+  return dialog;
+}
+
+/** The keys that pick each option, by label. */
+function keysByLabel(dialog: Dialog): Record<string, string | undefined> {
+  return Object.fromEntries(
+    dialog.options.map((option) => [option.label, keysFor(dialog, option)]),
+  );
+}
 
 describe("detectDialog", () => {
-  it.each([
-    ["the captured trust dialog", TRUST_SCREEN, { kind: "trust", keys: DOWN + "\r" }],
-    // Built from the text quoted in the task; no capture of this dialog exists yet.
-    [
-      "the Code Mode confirmation",
-      "Code Mode is experimental.\n  ❯ No, start without it \n Yes, turn on Code Mode\n\n  Enter to confirm",
-      { kind: "code-mode", keys: DOWN + "\r" },
-    ],
-    [
-      "a redraw with the cursor on Yes",
-      TRUST_SCREEN + "\n    No, exit \n  ❯ Yes, I trust this folder\n",
-      { kind: "trust", keys: "\r" },
-    ],
-    [
-      "lines that end with a carriage return",
-      "Code Mode is experimental.\r  ❯ No, start without it \r Yes, turn on Code Mode\r",
-      { kind: "code-mode", keys: DOWN + "\r" },
-    ],
-    ["no cursor before Yes", "Yes, I trust this folder", { kind: "trust", keys: undefined }],
-    [
-      "a cursor too far above Yes",
-      "❯ prompt\n\n\n\n\n Yes, turn on Code Mode",
-      { kind: "code-mode", keys: undefined },
-    ],
-  ])("reads %s", (_name, screen, dialog) => {
-    expect(detectDialog(screen)).toEqual(dialog);
+  it("reads the trust dialog", () => {
+    const dialog = dialogOf(TRUST_SCREEN);
+    expect(dialog).toMatchObject({
+      kind: "trust",
+      question: "Quick safety check: Is this a project you created or one you trust?",
+      cursor: 0,
+      options: [
+        { label: "No, exit", kind: "reject_once", row: 0 },
+        { label: "Yes, I trust this folder", kind: "allow_once", row: 1 },
+      ],
+    });
+    expect(dialog.excerpt).toMatch(/^Accessing workspace:\n<cwd>\n/);
+    expect(keysByLabel(dialog)).toEqual({
+      "No, exit": "\r",
+      "Yes, I trust this folder": DOWN + "\r",
+    });
   });
 
-  it("finds no dialog on the ready prompt", () => {
-    const ready = fixtureText("ready-screen.txt");
-    expect(detectDialog(ready)).toBeUndefined();
+  it("reads the trust dialog with the \\r\\r\\n line ends of a live PTY", () => {
+    const dialog = dialogOf(TRUST_SCREEN.replaceAll("\n", " \r\r\n"));
+    expect(dialog).toMatchObject({ kind: "trust", cursor: 0 });
+    expect(dialog.options.map(({ label }) => label)).toEqual([
+      "No, exit",
+      "Yes, I trust this folder",
+    ]);
+  });
+
+  it.each([
+    ["the Code Mode confirmation", CODE_MODE_SCREEN],
+    ["lines that end with a carriage return", CODE_MODE_SCREEN.replaceAll("\n", "\r")],
+  ])("reads %s", (_name, screen) => {
+    const dialog = dialogOf(screen);
+    expect(dialog).toMatchObject({ kind: "code-mode", cursor: 0 });
+    expect(keysByLabel(dialog)).toEqual({
+      "No, start without it": "\r",
+      "Yes, turn on Code Mode": DOWN + "\r",
+    });
+  });
+
+  it("reads a Write permission and leaves out its mode switch", () => {
+    const dialog = dialogOf(WRITE_SCREEN);
+    expect(dialog).toMatchObject({
+      kind: "permission",
+      question: "Do you want to create hello.txt?",
+      cursor: 0,
+      options: [
+        { label: "Yes", kind: "allow_once", row: 0 },
+        // Row 1, "Yes, and switch to accept edits…", is not offered.
+        { label: "No", kind: "reject_once", row: 2 },
+      ],
+    });
+    expect(dialog.excerpt).toBe("Create file\nhello.txt\n1 hi\nDo you want to create hello.txt ?");
+    expect(keysByLabel(dialog)).toEqual({ Yes: "\r", No: DOWN.repeat(2) + "\r" });
+  });
+
+  it("reads a Bash permission with a wrapped option and a split escape", () => {
+    const dialog = dialogOf(BASH_SCREEN);
+    expect(dialog).toMatchObject({
+      kind: "permission",
+      question: "Do you want to proceed?",
+      cursor: 0,
+      options: [
+        { label: "Yes", kind: "allow_once", row: 0 },
+        {
+          label:
+            "Yes, and don't ask again for mkdir -p made and touch made/x.txt commands in <cwd-start> <cwd-end>",
+          kind: "allow_always",
+          row: 1,
+        },
+        // Row 2, "Yes, and switch to auto mode", is not offered.
+        { label: "No", kind: "reject_once", row: 3 },
+      ],
+    });
+    expect(dialog.excerpt).toContain("Bash command\n");
+    expect(dialog.excerpt).toContain("mkdir -p made && touch made/x.txt\n");
+    expect(dialog.excerpt).not.toContain("switch to");
+    expect(dialog.options.map(({ label }) => label).join()).not.toContain("switch to");
+    expect(keysFor(dialog, dialog.options[2])).toBe(DOWN.repeat(3) + "\r");
+  });
+
+  it("counts the keys from a cursor on another row", () => {
+    // A redraw with the cursor on "No".
+    const screen = BASH_SCREEN.replace("❯  1.", "   1.").replace("    4.  No", " ❯  4.  No");
+    const dialog = dialogOf(screen);
+    expect(dialog.cursor).toBe(3);
+    expect(keysFor(dialog, dialog.options[0])).toBe(UP.repeat(3) + "\r");
+    expect(keysFor(dialog, dialog.options[1])).toBe(UP.repeat(2) + "\r");
+    expect(keysFor(dialog, dialog.options[2])).toBe("\r");
+  });
+
+  it("gives no keys when no cursor is on the list", () => {
+    const dialog = dialogOf(TRUST_SCREEN.replace("❯ No, exit", "  No, exit"));
+    expect(dialog.cursor).toBeUndefined();
+    expect(dialog.options.map((option) => keysFor(dialog, option))).toEqual([undefined, undefined]);
+  });
+
+  it.each([
+    ["the ready prompt", fixtureText("ready-screen.txt")],
+    [
+      "options that are not Yes or No",
+      "Pick a theme\n ❯ 1. Dark\n   2. Light\n\n Enter to confirm",
+    ],
+    ["a list with no footer", "Do you want to make this edit?\n ❯ 1. Yes\n   2. No\n"],
+    ["a list numbered from 2", "Proceed?\n ❯ 2. Yes\n   3. No\n\n Esc to cancel"],
+  ])("finds no dialog on %s", (_name, screen) => {
+    expect(detectDialog(screen)).toBeUndefined();
   });
 });
 

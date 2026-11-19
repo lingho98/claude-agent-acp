@@ -2,11 +2,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TuiEngine } from "../../tui/engine.js";
+import type { ChoiceOption, Dialog } from "../../tui/dialogs.js";
+import { TuiEngine, type TuiEngineOptions } from "../../tui/engine.js";
 import type { TranscriptRecord } from "../../tui/transcript.js";
 import { fixture, fixtureText } from "./fixture.js";
 
 const SESSION_ID = "00000000-0000-4000-8000-000000000001";
+const DOWN = "\x1b[B";
 // Built from the text quoted in the task; no capture of this dialog exists yet (see dialogs.test.ts).
 const CODE_MODE_SCREEN =
   "Code Mode is experimental.\n  ❯ No, start without it \n Yes, turn on Code Mode\n\n  Enter to confirm";
@@ -16,6 +18,10 @@ const fake = vi.hoisted(() => {
   class FakePty {
     readonly pid = 4242;
     readonly written: string[] = [];
+    /** The signals `kill` got; `undefined` is node-pty's default, SIGHUP. */
+    readonly signals: Array<string | undefined> = [];
+    /** Set: the fake CLI exits on SIGKILL only, like one that hangs on SIGHUP. */
+    ignoreHangup = false;
     private dataListener: ((chunk: string) => void) | undefined;
     private exitListener: ((event: { exitCode: number }) => void) | undefined;
 
@@ -33,8 +39,11 @@ const fake = vi.hoisted(() => {
       this.written.push(data);
     }
 
-    kill() {
-      this.exit(0);
+    kill(signal?: string) {
+      this.signals.push(signal);
+      if (!this.ignoreHangup || signal === "SIGKILL") {
+        this.exit(0);
+      }
     }
 
     output(chunk: string) {
@@ -76,6 +85,46 @@ describe("TuiEngine", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  /** Replaces the engine with one whose `askUser` is the test's. */
+  function engineWith(askUser: NonNullable<TuiEngineOptions["askUser"]>) {
+    void engine.dispose();
+    engine = new TuiEngine({
+      cwd: root,
+      sessionId: SESSION_ID,
+      projectsRoot: root,
+      quiescenceMs: 50,
+      askUser,
+    });
+  }
+
+  /** An `askUser` the test answers: `next()` waits for the next question. */
+  function userAsked() {
+    const questions: Array<{
+      dialog: Dialog;
+      signal: AbortSignal;
+      choose: (pick: (options: ChoiceOption[]) => ChoiceOption | undefined) => void;
+    }> = [];
+    const askUser = (dialog: Dialog, signal: AbortSignal) =>
+      new Promise<ChoiceOption | undefined>((resolve) =>
+        questions.push({ dialog, signal, choose: (pick) => resolve(pick(dialog.options)) }),
+      );
+    const next = async (count: number) => {
+      await vi.waitFor(() => expect(questions).toHaveLength(count), { timeout: 3000 });
+      return questions[count - 1];
+    };
+    return { askUser, questions, next };
+  }
+
+  function writeTranscript(name: string) {
+    mkdirSync(path.join(root, "-project"), { recursive: true });
+    writeFileSync(
+      path.join(root, "-project", `${SESSION_ID}.jsonl`),
+      fixture(name)
+        .map((r) => JSON.stringify(r) + "\n")
+        .join(""),
+    );
+  }
+
   /** Starts a turn and plays the CLI's startup until the prompt is typed. */
   async function promptPastStartup(text: string, ...screens: string[]) {
     const turn = engine.prompt(text);
@@ -89,6 +138,8 @@ describe("TuiEngine", () => {
     await vi.waitFor(() => expect(pty.written).toContain(`\x1b[200~${text}\x1b[201~`), {
       timeout: 3000,
     });
+    // The Enter that submits it, 200 ms after the paste.
+    await vi.waitFor(() => expect(pty.written.at(-1)).toBe("\r"));
     return { turn, pty };
   }
 
@@ -210,5 +261,118 @@ describe("TuiEngine", () => {
       /can't answer\.\n\nScreen:\n[\s\S]*Do you want to make this edit\?/,
     );
     expect(pty.written).toContain("\x03");
+  });
+  it("asks the user about the trust dialog and goes on once they trust the folder", async () => {
+    const user = userAsked();
+    engineWith(user.askUser);
+    const dialogs: string[] = [];
+    engine.on("dialog", (kind) => dialogs.push(kind));
+    const turn = engine.prompt("hi");
+    await vi.waitFor(() => expect(fake.ptys).toHaveLength(1));
+    const pty = fake.ptys[0];
+    pty.output(fixtureText("trust-screen.txt"));
+    const asked = await user.next(1);
+    expect(asked.dialog).toMatchObject({ kind: "trust" });
+    expect(pty.written).toEqual([]);
+
+    asked.choose((options) => options.find(({ kind }) => kind === "allow_once"));
+    await vi.waitFor(() => expect(pty.written).toEqual([DOWN + "\r"]));
+    expect(dialogs).toEqual(["trust"]);
+    pty.output(fixtureText("ready-screen.txt"));
+    await vi.waitFor(() => expect(pty.written).toContain("\x1b[200~hi\x1b[201~"), {
+      timeout: 3000,
+    });
+    engine.cancel();
+    await turn.done;
+  });
+
+  it("fails the prompt, naming the folder, when the user declines to trust it", async () => {
+    const user = userAsked();
+    engineWith(user.askUser);
+    const turn = engine.prompt("hi");
+    await vi.waitFor(() => expect(fake.ptys).toHaveLength(1));
+    const pty = fake.ptys[0];
+    pty.output(fixtureText("trust-screen.txt"));
+    (await user.next(1)).choose((options) => options.find(({ kind }) => kind === "reject_once"));
+    await expect(turn.done).rejects.toThrow(`You declined to trust the folder ${root}`);
+    expect(pty.written).toEqual([]);
+    expect(engine.stopped).toBe(true);
+  });
+
+  it("answers the trust dialog No and ends the turn cancelled when the client cancels the request", async () => {
+    const user = userAsked();
+    engineWith(user.askUser);
+    const turn = engine.prompt("hi");
+    await vi.waitFor(() => expect(fake.ptys).toHaveLength(1));
+    const pty = fake.ptys[0];
+    pty.output(fixtureText("trust-screen.txt"));
+    (await user.next(1)).choose(() => undefined);
+    expect(await turn.done).toEqual({ stopReason: "cancelled" });
+    // The cursor is on "No, exit".
+    expect(pty.written).toEqual(["\r"]);
+    await vi.waitFor(() => expect(engine.stopped).toBe(true));
+  });
+
+  it("relays each tool permission of a turn and answers the user's choice", async () => {
+    const user = userAsked();
+    engineWith(user.askUser);
+    const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));
+    const sent = pty.written.length;
+    pty.output(fixtureText("tool-bash-screen.txt"));
+    const first = await user.next(1);
+    expect(first.dialog).toMatchObject({ kind: "permission", question: "Do you want to proceed?" });
+    // The spinner keeps drawing under the dialog: one question, not one per redraw.
+    pty.output("  ⏺    \r   4    \r");
+    first.choose((options) => options.find(({ kind }) => kind === "allow_always"));
+    await vi.waitFor(() => expect(pty.written.slice(sent)).toContain(DOWN + "\r"));
+    expect(user.questions).toHaveLength(1);
+
+    pty.output(fixtureText("tool-bash-screen.txt"));
+    (await user.next(2)).choose((options) => options.find(({ kind }) => kind === "reject_once"));
+    await vi.waitFor(() => expect(pty.written).toContain(DOWN.repeat(3) + "\r"));
+    // The CLI ends the turn on "No" with an interruption row and nothing more.
+    writeTranscript("rejected-turn");
+    expect(await turn.done).toMatchObject({ stopReason: "interrupted" });
+    expect(pty.written).not.toContain("\x03");
+  });
+
+  it.each([
+    ["the prompt is cancelled", "cancel"],
+    ["the client cancels the request", "no choice"],
+  ])("answers No and ends the turn cancelled when %s", async (_name, how) => {
+    const user = userAsked();
+    engineWith(user.askUser);
+    const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));
+    pty.output(fixtureText("tool-bash-screen.txt"));
+    const asked = await user.next(1);
+    const sent = pty.written.length;
+    if (how === "cancel") {
+      engine.cancel();
+      expect(asked.signal.aborted).toBe(true);
+    } else {
+      asked.choose(() => undefined);
+    }
+    expect(await turn.done).toEqual({ stopReason: "cancelled" });
+    await vi.waitFor(() => expect(pty.written.slice(sent)).toEqual([DOWN.repeat(3) + "\r"]));
+    // A late answer writes nothing, and no Ctrl+C or Esc lands on the input box.
+    asked.choose((options) => options[0]);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(pty.written.slice(sent)).toEqual([DOWN.repeat(3) + "\r"]);
+  });
+
+  it("waits for the CLI to exit on dispose and kills it after 3 s", { timeout: 8000 }, async () => {
+    const { turn, pty } = await promptPastStartup("hi", fixtureText("ready-screen.txt"));
+    pty.ignoreHangup = true;
+    let disposed = false;
+    const dispose = engine.dispose().then(() => (disposed = true));
+    await expect(turn.done).resolves.toEqual({ stopReason: "cancelled" });
+    expect(pty.signals).toEqual([undefined]);
+    await new Promise((resolve) => setTimeout(resolve, 2800));
+    expect(disposed).toBe(false);
+    await dispose;
+    expect(pty.signals).toEqual([undefined, "SIGKILL"]);
+    // Already gone: at once.
+    await engine.dispose();
+    expect(pty.signals).toHaveLength(2);
   });
 });
