@@ -462,6 +462,24 @@ describe("TuiEngine", () => {
     await next.done;
   });
 
+  it("writes the answer's keys when the asked dialog is drawn again after the input box", async () => {
+    const user = userAsked();
+    engineWith(user.askUser);
+    const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));
+    let ended = false;
+    const end = () => (ended = true);
+    void turn.done.then(end, end);
+    const sent = pty.written.length;
+    pty.output(fixtureText("tool-bash-screen.txt"));
+    const asked = await user.next(1);
+    pty.output(fixtureText("ready-screen.txt"));
+    pty.output(fixtureText("tool-bash-screen.txt"));
+    asked.choose((options) => options.find(({ kind }) => kind === "allow_once"));
+    await vi.waitFor(() => expect(pty.written.slice(sent)).toEqual(["\r"]));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(ended).toBe(false);
+  });
+
   it("declines with Esc and fails the turn when the permission request fails", async () => {
     engineWith(async () => Promise.reject(new Error("connection closed")));
     const { turn, pty } = await promptPastStartup("make it", fixtureText("ready-screen.txt"));

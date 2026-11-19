@@ -154,6 +154,18 @@ describe("TranscriptToAcp", () => {
     );
   });
 
+  it("drops a settle written before its dispatch when the turn ends", () => {
+    const [settle, call, dispatch] = fixture("repl-error-fast");
+    const { adapter } = updatesOf([settle]);
+    adapter.endTurn();
+    const updates = [call, dispatch].flatMap((record) => adapter.updates(record));
+    expect(updates.at(-1)?.update).toEqual({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_015RoZf8jfr9hmrqVFteEV1N",
+      status: "in_progress",
+    });
+  });
+
   it("fails a REPL call whose script threw before its dispatch was written, and drops its repeat", () => {
     // CLI 2.1.328 writes the settle event of a script that threw within ~50 ms before the call.
     const records = fixture("repl-error-fast");
