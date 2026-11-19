@@ -25,7 +25,8 @@ on:
 
 jobs:
   release-please:
-    if: ${{ github.event_name == 'push' }}
+    # The fork (lingho98/claude-agent-acp) tags v<base>-tui.<n> by hand and never publishes.
+    if: ${{ github.repository == 'agentclientprotocol/claude-agent-acp' && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     environment: release # Optional: for enhanced security
     permissions:
@@ -62,7 +63,7 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     needs: [release-please]
-    if: ${{ always() && ((github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' && inputs.publish_npm) || needs.release-please.outputs.release_created == 'true') }}
+    if: ${{ github.repository == 'agentclientprotocol/claude-agent-acp' && always() && ((github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' && inputs.publish_npm) || needs.release-please.outputs.release_created == 'true') }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -131,10 +132,12 @@ jobs:
     # the same tree twice; either match is enough to skip the preview.
     if: >-
       ${{
+        github.repository == 'agentclientprotocol/claude-agent-acp' && (
         (github.event_name == 'workflow_dispatch' && inputs.channel == 'preview') ||
         (github.event_name == 'push'
           && github.event.head_commit.author.name != 'acp-release-bot[bot]'
           && !startsWith(github.event.head_commit.message, 'chore(main): release '))
+        )
       }}
     # Same environment as the stable job, so the npm trusted-publisher binding holds.
     # It carries no required reviewers, so previews never wait for an approval.
@@ -243,7 +246,7 @@ jobs:
     # unchanged: it names no version, and the registry resolves what it needs itself.
     if: >-
       ${{
-        always() && (
+        github.repository == 'agentclientprotocol/claude-agent-acp' && always() && (
           needs.publish-npm.result == 'success'
           || needs.publish-npm-preview.outputs.published == 'true'
           || (github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' && !inputs.publish_npm)

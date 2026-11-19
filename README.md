@@ -1,3 +1,7 @@
+> [!NOTE]
+> This fork adds a terminal engine for Code Mode — see [FORK.md](FORK.md).
+> Without `CLAUDE_ACP_ENGINE=tui` it serves the upstream SDK engine.
+
 # ACP adapter for the Claude Agent SDK
 
 [![npm](https://img.shields.io/npm/v/%40agentclientprotocol%2Fclaude-agent-acp)](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)
