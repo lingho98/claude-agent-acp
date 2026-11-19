@@ -12,7 +12,9 @@
  * 3. `queue-operation` enqueue `<event kind="repl-eval" eval="N" status="settled"><result>…`:
  *    the code finished; the call completes with that result. A script that
  *    threw settles with an `<error>` in place of the `<result>`, and fails the
- *    call. The event escapes `<`, `>` and `&` in the text.
+ *    call. The event escapes `<`, `>` and `&` in the text. A script that
+ *    threw within ~50 ms settles before steps 1 and 2 are written; the
+ *    event then waits for its dispatch.
  * 4. The tools the code called, as `isVirtual` assistant/user pairs with
  *    `repl_…` ids. No field links them to their REPL call, so each is a tool
  *    call of its own. After a script threw, a `repl-error-…` pair repeats its
@@ -20,7 +22,8 @@
  *
  * A REPL call that ends within its turn has no dispatch: its `tool_result`
  * holds `<repl-output><tools-used-before-summary>…</…><result>…</result></repl-output>`,
- * and the call shows the result's text.
+ * and the call shows the result's text. After a declined permission that
+ * text is the first of the result's text blocks.
  *
  * Every other record (`mode`, `attachment`, `api-request`, the other
  * `system` rows, …) is dropped.
@@ -59,6 +62,8 @@ export class TranscriptToAcp {
   private readonly emittedToolCalls = new Set<string>();
   /** The REPL call of each eval that runs on, from "(dispatched #N)" to its settle event. */
   private readonly dispatched = new Map<number, string>();
+  /** Settle events written before their eval's "(dispatched #N)", by eval number. */
+  private readonly earlySettles = new Map<number, ReplEval>();
   /** REPL calls failed with a thrown error whose `repl-error-…` pair is still to drop. */
   private failedRepls = 0;
   /** The `repl-error-…` tool calls dropped, whose results are dropped too. */
@@ -102,6 +107,7 @@ export class TranscriptToAcp {
     }));
     this.emittedToolCalls.clear();
     this.dispatched.clear();
+    this.earlySettles.clear();
     this.failedRepls = 0;
     this.droppedReplErrors.clear();
     for (const id of Object.keys(this.toolUseCache)) {
@@ -142,7 +148,9 @@ export class TranscriptToAcp {
       .filter((block) => !this.droppedReplErrors.delete(block.tool_use_id as string))
       .map((block) => this.withReplOutput(block));
     if (blocks.length > 0 && results.length === 0) {
-      return []; // The result of a dropped `repl-error-…` call.
+      // The result of a dropped `repl-error-…` call. On replay the prompt branch below would
+      // pass it to `toAcpNotifications`, which logs a result of an untracked call.
+      return [];
     }
     if (results.length === 0) {
       // The user's prompt: the client sent it, so only a replay shows it.
@@ -158,6 +166,11 @@ export class TranscriptToAcp {
       dispatch?.asyncDispatched === true &&
       typeof dispatch.evalId === "number"
     ) {
+      const early = this.earlySettles.get(dispatch.evalId);
+      if (early) {
+        this.earlySettles.delete(dispatch.evalId);
+        return this.settled(toolCallId, early, replay);
+      }
       this.dispatched.set(dispatch.evalId, toolCallId);
       return [
         {
@@ -175,11 +188,19 @@ export class TranscriptToAcp {
       record.operation === "enqueue" && typeof record.content === "string"
         ? replEvalEvent(record.content)
         : undefined;
-    const toolUseId = event && this.dispatched.get(event.evalId);
-    if (!event || !toolUseId) {
+    if (!event) {
+      return [];
+    }
+    const toolUseId = this.dispatched.get(event.evalId);
+    if (!toolUseId) {
+      this.earlySettles.set(event.evalId, event);
       return [];
     }
     this.dispatched.delete(event.evalId);
+    return this.settled(toolUseId, event, replay);
+  }
+
+  private settled(toolUseId: string, event: ReplEval, replay: boolean): SessionNotification[] {
     const isError = event.status !== "settled" || event.tag === "error";
     if (event.tag === "error") {
       this.failedRepls++;
@@ -195,11 +216,23 @@ export class TranscriptToAcp {
 
   /** A REPL `tool_result` whose text is a `<repl-output>`, with the plain text of its result. */
   private withReplOutput(block: ContentBlock): ContentBlock {
-    const call = this.toolUseCache[block.tool_use_id as string];
-    const output =
-      call?.name === "REPL" && typeof block.content === "string"
-        ? replOutput(block.content)
-        : undefined;
+    if (this.toolUseCache[block.tool_use_id as string]?.name !== "REPL") {
+      return block;
+    }
+    if (Array.isArray(block.content)) {
+      // A declined permission: `[{type: "text", text: "<repl-output>\n<error>The user doesn't
+      // want to proceed…"}, {type: "text", text: "The user stopped this call…"}]`, is_error
+      // set. No `repl-error-…` pair repeats it, so no failed REPL call is counted.
+      const parts = (block.content as Array<{ type?: unknown; text?: unknown }>).map((part) => {
+        const output =
+          part?.type === "text" && typeof part.text === "string"
+            ? replOutput(part.text)
+            : undefined;
+        return output ? { ...part, text: output.text } : part;
+      });
+      return { ...block, content: parts };
+    }
+    const output = typeof block.content === "string" ? replOutput(block.content) : undefined;
     if (!output) {
       return block;
     }
@@ -239,14 +272,14 @@ export class TranscriptToAcp {
   }
 }
 
+type ReplEval = { evalId: number; status: string | undefined; output: string; tag?: string };
+
 /**
  * The eval number, status, output and its tag (`result` or `error`) of a
  * `repl-eval` event, e.g.
  * `<event nonce="…" kind="repl-eval" eval="1" ms="1209" status="settled">\n<result>one.txt</result>\n</event>`.
  */
-function replEvalEvent(
-  text: string,
-): { evalId: number; status: string | undefined; output: string; tag?: string } | undefined {
+function replEvalEvent(text: string): ReplEval | undefined {
   const head = /^<event\b([^>]*)>/.exec(text);
   if (!head || attribute(head[1], "kind") !== "repl-eval") {
     return undefined;

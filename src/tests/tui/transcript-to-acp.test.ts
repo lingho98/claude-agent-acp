@@ -1,5 +1,5 @@
 import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { TranscriptToAcp } from "../../tui/transcript-to-acp.js";
 import type { TranscriptRecord } from "../../tui/transcript.js";
 import { fixture } from "./fixture.js";
@@ -152,6 +152,76 @@ describe("TranscriptToAcp", () => {
     expect(callUpdates(updatesOf(records.slice(-2)).updates, replError)).toContainEqual(
       expect.objectContaining({ status: "failed" }),
     );
+  });
+
+  it("fails a REPL call whose script threw before its dispatch was written, and drops its repeat", () => {
+    // CLI 2.1.328 writes the settle event of a script that threw within ~50 ms before the call.
+    const records = fixture("repl-error-fast");
+    expect(records.map(({ type }) => type).slice(0, 3)).toEqual([
+      "queue-operation",
+      "assistant",
+      "user",
+    ]);
+    const { updates } = updatesOf(records);
+    const repl = callUpdates(updates, "toolu_015RoZf8jfr9hmrqVFteEV1N");
+    expect(repl.filter((update) => "status" in update && update.status === "failed")).toEqual([
+      expect.objectContaining({
+        content: [
+          codeBlock("throw new Error('boom <x>')"),
+          {
+            type: "content",
+            content: { type: "text", text: expect.stringMatching(/^```\nError: boom <x>\n/) },
+          },
+        ],
+      }),
+    ]);
+    expect(callUpdates(updates, "repl-error-0d088033-9dcd-416d-8e6e-27f14bbfa143")).toEqual([]);
+  });
+
+  it("shows a REPL call stopped by a declined permission without the wrapper tags", () => {
+    const { updates } = updatesOf(fixture("repl-declined"));
+    const repl = callUpdates(updates, "toolu_015MLah8fZ3GvLMfuR9CWyg3");
+    expect(repl.at(-1)).toMatchObject({ status: "failed" });
+    expect(JSON.stringify(repl.at(-1))).toContain("The user doesn't want to proceed");
+    expect(JSON.stringify(updates)).not.toMatch(/<\/?(repl-output|error)>/);
+  });
+
+  it("fails a REPL call that ended within its turn with an error, and drops its repeat", () => {
+    const [call, result] = fixture("repl-output");
+    const replError = fixture("repl-error").slice(-2);
+    const thrown = {
+      ...result,
+      message: {
+        role: "user",
+        content: [
+          {
+            tool_use_id: "toolu_015d69hs84ghGQTRzH7RrkQQ",
+            type: "tool_result",
+            content:
+              "<repl-output>\n<tools-used-before-summary>Read</tools-used-before-summary>\n<error>Error: boom</error>\n</repl-output>",
+            is_error: false,
+          },
+        ],
+      },
+    };
+    const { updates } = updatesOf([call, thrown, ...replError]);
+    expect(callUpdates(updates, "toolu_015d69hs84ghGQTRzH7RrkQQ").at(-1)).toMatchObject({
+      status: "failed",
+      content: [
+        expect.anything(),
+        { type: "content", content: { type: "text", text: "```\nError: boom\n```" } },
+      ],
+    });
+    expect(callUpdates(updates, "repl-error-8be964b9-26af-4bb2-bddd-babb6318f283")).toEqual([]);
+  });
+
+  it("replays a dropped repl-error result without logging it as untracked", () => {
+    const logger = { log: vi.fn(), error: vi.fn() };
+    const adapter = new TranscriptToAcp({ sessionId: "s", cwd: "<cwd>", logger });
+    for (const record of fixture("repl-error")) {
+      adapter.updates(record, { replay: true });
+    }
+    expect(logger.error).not.toHaveBeenCalled();
   });
 
   it("undoes &amp; last in a settled eval's text", () => {
