@@ -81,6 +81,8 @@ const SPINNER_REDRAW = /^[^\p{L}─❯]*(\d+s[^\p{L}─❯]*)?$/u;
 const RULE = /^─{10,}$/;
 /** Lines {@link Dialog.excerpt} takes at most from a dialog with no rule above it (trust, Code Mode). */
 const EXCERPT_LINES = 12;
+/** The first excerpt line of a capped dialog; its count grows with the log above the dialog. */
+const HIDDEN_LINES = /^… \(\d+ more lines not shown\)\n/;
 /** Lines of one option list at most; more means the footer belongs to something else. */
 const MAX_OPTION_LINES = 12;
 
@@ -137,10 +139,11 @@ export function detectDialog(screen: string): Dialog | undefined {
 /**
  * Whether `a` and `b` are one dialog drawn twice: the same lines above the
  * options (the command or file a tool permission names), options and cursor.
+ * The count of a capped excerpt's hidden lines may differ.
  */
 export function sameDialog(a: Dialog, b: Dialog): boolean {
   return (
-    a.excerpt === b.excerpt &&
+    a.excerpt.replace(HIDDEN_LINES, "") === b.excerpt.replace(HIDDEN_LINES, "") &&
     a.cursor === b.cursor &&
     a.options.length === b.options.length &&
     a.options.every(({ label }, i) => label === b.options[i].label)

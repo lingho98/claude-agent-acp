@@ -9,7 +9,8 @@
  * the user is asked, a failed or cancelled request, and a dialog that differs
  * from the one the user is asked about, which fails the turn. The trust
  * dialog is never answered without the user: declining it, or no `askUser`,
- * fails the prompt and names the folder.
+ * fails the prompt and names the folder. A mid-turn answer that arrives after
+ * the CLI closed its dialog, "No" included, writes no keys and fails the turn.
  */
 
 import { randomUUID } from "node:crypto";
@@ -488,7 +489,7 @@ export class TuiEngine extends EventEmitter<TuiEngineEvents> {
       this.asking = undefined;
       const since = pty.screenSince(mark);
       if (showsInputBox(since) && !detectDialog(since)) {
-        // The keys would land on the input box: an arrow recalls a prompt there, Enter sends it.
+        // The answer's keys would land on the input box, not on the dialog.
         this.endTurn(
           new Error(
             `The Claude CLI closed the dialog "${dialog.question}" before your answer arrived, ` +

@@ -142,6 +142,10 @@ describe("detectDialog", () => {
     expect(lines).toHaveLength(13);
     expect(lines.slice(0, 2)).toEqual(["… (4 more lines not shown)", "note 5"]);
     expect(lines.at(-1)).toBe("Code Mode is experimental.");
+    // Drawn again under more log: another count of hidden lines, the same dialog.
+    const redraw = dialogOf(`${screen}\nmore\n${screen}\n${CODE_MODE_SCREEN}`);
+    expect(redraw.excerpt).toMatch(/^… \(20 more lines not shown\)\n/);
+    expect(sameDialog(dialog, redraw)).toBe(true);
   });
 
   it("counts the keys from a cursor on another row", () => {
