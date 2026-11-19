@@ -230,6 +230,22 @@ describe("TuiAcpAgent", () => {
     expect(engines[0].prompts).toEqual(["first"]);
   });
 
+  it("prompts no CLI when the session closes while its transcript is looked up", async () => {
+    const { sessionId } = await agent.newSession({ cwd: "/work", mcpServers: [] });
+    const turn = prompt(sessionId, "first");
+    // `runTurn` now awaits `findTranscript`.
+    for (let i = 0; i < 5; i++) {
+      await null;
+    }
+    await agent.closeSession({ sessionId });
+    const result = await Promise.race([
+      turn,
+      new Promise((resolve) => setTimeout(() => resolve("still running"), 500)),
+    ]);
+    expect(result).toEqual({ stopReason: "cancelled" });
+    expect(engines.flatMap(({ prompts }) => prompts)).toEqual([]);
+  });
+
   it("sends a resource link as its URI, and refuses an image and an empty prompt", async () => {
     const { sessionId } = await agent.newSession({ cwd: "/work", mcpServers: [] });
     const turn = agent.prompt({
